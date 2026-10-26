@@ -321,3 +321,41 @@ console errors. Timings on MPS: first token 0.7–2.1 s warm, about 9 tok/s acro
 
 **Not done.** The Claude agent cannot name or load a person yet; the advisor tab still scores once at the end;
 no rename or delete in the UI.
+
+## 2026-10-26 — the money lens, and an asleep screen on public data
+
+The Money person was being asked to analyse the stock market. Probed, it returns the baseline's disclaimer with
+"money" substituted for "financial", so the ask was answered two ways instead: an instrument that reads text, and a
+screen that reads filings.
+
+**The lens measures displacement, not opinion.** `explorer/money_lens.py` reads a document sentence by sentence
+with three rows in one batch (person / baseline / reversed set) and reports the log-probability each row puts on a
+fixed 80-word money lexicon, minus the same for a neutral lexicon of function words. On the CRAI 10-K's Item 1A
+(24 sentences), `amp` runs +4.8 down to +0.97, all positive: the person raises money mass on every sentence, and
+the neutral term keeps that from being read as "the model got sharper". The set does not add money words
+everywhere — the top-ranked sentence ends up at 13.6 money words per 100 in the rewrite against 3.2 in the source
+and 6.5 in the baseline — which is the measurement that makes the rewrite evidence rather than prose.
+
+**Two numbers worth keeping.** 24 sentences scored in 42 s on MPS; one rewrite of 64 tokens takes ~13 s because
+the same three-row batch decode that the chat uses costs 9 tok/s across rows. Both scale linearly, so a 60-sentence
+filing is a coffee break, not a run.
+
+**The screen's funnel is the honest part.** 1,113 US names at $150M–3B → 542 with revenue reported and not
+shrinking → 128 under the analyst-coverage ceiling → 13 meeting ≥3 of 5 criteria, one of them at 4. Every row
+carries the source of each number and the criteria are printed with thresholds. Two things it deliberately cannot
+say: whether a low price is low for a reason, and anything after the last filing.
+
+**A bug class, not a bug.** The SSE sentinel was being put on the queue from the worker thread while the last event
+was still queued as a loop callback. The sentinel won, the `done` event vanished, and the stream looked complete —
+the report was on disk, no exception, no error event. Everything on that queue now goes through the loop, including
+the terminator, in both the advisor and money endpoints.
+
+**Verified.** `scripts/verify_money.py`: 68 checks, exit 0 — lens end to end against the live server (bad slug and
+no-document rejected, full stage sequence, `amp == d_money - d_neutral` on every row, ranking sorted, three
+rewrites, person ≠ baseline, report on disk with its disclaimers) and the screen re-derived from its own report
+(every criterion recomputed from the numbers beside it, coverage rule, two-year P/S floor). Browser: 24 ranked
+sentences, 2 rewrite blocks, firing readout advancing per token, zero console errors.
+
+**Not done.** No upstream PR (the origin repo is read-only for this account); the sleepers list is a description of
+public numbers, not a portfolio, and nothing here has been checked against a later filing or a price after
+2026-10-24.

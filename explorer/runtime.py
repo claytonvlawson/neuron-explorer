@@ -275,6 +275,50 @@ class Runtime:
                 self._fire = None
         yield ("end", None, None) if typed else (None, None)
 
+    def score_multi(self, pushes, rows_messages, lex_sets=None, top=6):
+        """One teacher-forced pass per row, no generation: what each row's next-token distribution is, with the same
+        pushes applied as steer_multi (row 0 pushed, row 1 left alone, row 2 reversed).
+
+        lex_sets is {name: [token ids]}. For each set the row's mass over it is reported as logsumexp of the
+        log-softmax over those ids, in nats: comparable across rows, and a number with no sampled completion
+        behind it. That is the honest way to ask "did the person make money-words more likely here".
+
+        Returns [{"row", "mass": {name: nats}, "lex": {name: [(text, p)]}, "top": [(text, p)]}] in row order.
+        """
+        self.ensure_loaded()
+        with self.lock:
+            push = [self._push_entry(layer, n, dose, mode, (1, 0, -1)) for layer, n, dose, mode in pushes]
+            seqs = [self.messages_ids(m) for m in rows_messages]
+            T = max(map(len, seqs))
+            pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
+            ids = torch.tensor([[pad] * (T - len(q)) + q for q in seqs], device=self.dev)
+            mask = torch.tensor([[0] * (T - len(q)) + [1] * len(q) for q in seqs], device=self.dev)
+            pos = (mask.cumsum(-1) - 1).clamp(min=0)
+            self._push = push
+            try:
+                with torch.inference_mode():
+                    logits = self.model(input_ids=ids, attention_mask=mask, position_ids=pos,
+                                        use_cache=False).logits[:, -1].float()
+            finally:
+                self._push = None
+            out = []
+            for r in range(ids.shape[0]):
+                lp = torch.log_softmax(logits[r], dim=-1)
+                k = min(top, lp.numel())
+                hit = lp.topk(k)
+                row = {"row": r, "mass": {}, "lex": {},
+                       "top": [(self.tok.decode([int(i)]), round(float(v.exp()), 4))
+                               for v, i in zip(hit.values, hit.indices)]}
+                for name, lex_ids in (lex_sets or {}).items():
+                    li = torch.tensor(sorted(set(int(i) for i in lex_ids)), device=lp.device)
+                    m = lp[li]
+                    row["mass"][name] = round(float(torch.logsumexp(m, dim=-1)), 4)
+                    lm = m.topk(min(top, m.numel()))
+                    row["lex"][name] = [(self.tok.decode([int(li[int(i)])]), round(float(v), 4))
+                                        for v, i in zip(lm.values, lm.indices)]
+                out.append(row)
+            return out
+
     def generate_messages(self, messages, max_new=320, cancel=None):
         """Greedy-decode one chat conversation with no steering. Yields (text_delta, token_id), then (None, None).
 
