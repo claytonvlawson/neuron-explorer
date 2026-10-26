@@ -18,3 +18,6 @@ explorer/cache/agent/
 *.zip
 explorer/names.json
 explorer/*.local.md
+
+# per-machine pod settings
+sweep/pod_template.json
