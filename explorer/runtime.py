@@ -44,10 +44,13 @@ class Runtime:
         self._heads = None  # [(layer, head, scale)]: attention heads scaled (0 = ablated) during a read; head None = all
         self._read = None  # (layer, neuron) while reading
         self._seen = {}
+        self._fire = None  # {"rows", "k", "out", "last"}: per-token top activations while steering (the live firing view)
+        self._fire_scale = None  # act_scale.npz as device tensors: the calibration the 'fires' view scores against
         self._con_cache = {}
         self._capture_all = None
         self._capture_from = 0
         self._capture_full = None
+        self._capture_pos = None
         self._lens_cache = {}
 
     # ---------- loading ----------
@@ -81,7 +84,10 @@ class Runtime:
         def hook(mod, inp):
             h = inp[0]
             if self._capture_full is not None:
-                self._capture_full[i] = h[0].float().cpu()  # [tokens, inter]
+                t = h[0]
+                if self._capture_pos is not None:  # score only these positions (a long advisor prompt is 1.2 MB/token/layer)
+                    t = t[self._capture_pos]
+                self._capture_full[i] = t.float().cpu()  # [tokens, inter]
             if self._capture_all is not None:
                 a = h[:, self._capture_from:].float().flatten(0, 1)  # [tokens, inter]
                 mx, amx = a.max(0)
@@ -91,6 +97,9 @@ class Runtime:
                 n = self._read[1]
                 self._seen["act"] = h[0, :, n].float().cpu()
             mine = [p for p in self._push if p[0] == i] if self._push else []
+            if self._fire is not None:
+                # before this layer's push: the dose you add is an instrument setting, not something the model did
+                self._record_fire(i, h, self._fire)
             if mine:
                 h = h.clone()
                 for _, n, mode, vals in mine:
@@ -100,8 +109,47 @@ class Runtime:
                         h[:, :, n] = h[:, :, n] * vals[:, None].to(h.dtype)
                     else:
                         h[:, :, n] = h[:, :, n] + vals[:, None].to(h.dtype)
-                return (h,)
+            return (h,) if mine else None
         return hook
+
+    def fire_scale(self):
+        """act_scale.npz on the model's device, resolved the way /api/infer scores: each side floored at a tenth of
+        the other, so a neuron that never goes negative is not divided by ~0."""
+        if self._fire_scale is None:
+            path = os.path.join(CACHE, "act_scale.npz")
+            if not os.path.exists(path):
+                self._fire_scale = (None, None)
+            else:
+                z = np.load(path)
+                pos = np.maximum(z["pos"], np.maximum(0.1 * -z["neg"], 1e-3)).astype(np.float32)
+                neg = np.minimum(z["neg"], np.minimum(-0.1 * z["pos"], -1e-3)).astype(np.float32)
+                self._fire_scale = (torch.from_numpy(pos), torch.from_numpy(neg))
+        sc = self._fire_scale
+        return sc if sc[0] is not None else None
+
+    def _record_fire(self, layer, h, fr):
+        """Append this layer's strongest activations for the token just processed: (n, score, act) per requested row.
+        During decode h is [rows, 1, inter]; during prefill only the last position matters (the one that predicts the
+        first generated token), and fr['last'] limits it to that. Measured before this layer's own push, so a dose you
+        set does not masquerade as the model firing."""
+        if h.shape[1] != 1 and not fr.get("last"):
+            return
+        sc = self.fire_scale()
+        col = -1 if h.shape[1] != 1 else 0
+        out = []
+        for r in fr["rows"]:
+            if r >= h.shape[0]:
+                continue
+            act = h[r, col].float()
+            if sc is not None:
+                pos, neg = sc[0][layer].to(act.device), sc[1][layer].to(act.device)
+                s = torch.where(act >= 0, act / pos, -(act / neg))
+            else:
+                s = act
+            k = min(fr["k"], s.numel())
+            idx = s.abs().topk(k).indices.tolist()
+            out.append((r, [(int(n), round(float(s[n]), 3), round(float(act[n]), 2)) for n in idx]))
+        fr["out"].append((layer, out))
 
     def _head_hook(self, i, n_heads):
         def hook(mod, inp):
@@ -162,13 +210,19 @@ class Runtime:
         Yields (row, text_delta), then (None, None)."""
         yield from self.steer_multi([(layer, n, dose, mode)], rows_messages, max_new, cancel)
 
-    def steer_multi(self, pushes, rows_messages, max_new=200, cancel=None):
+    def steer_multi(self, pushes, rows_messages, max_new=200, cancel=None, fire_rows=None, fire_k=12):
         """steer_stream for any number of neurons at once: pushes = [(layer, n, dose, mode)], all applied together.
-        Each is reversed in row 2 the same way a single neuron is (add: -dose; mul: x -dose)."""
+        Each is reversed in row 2 the same way a single neuron is (add: -dose; mul: x -dose).
+
+        With fire_rows ([0] for the person row, [0, 2] for person and anti-person) it also reports what fires: the
+        layer's top fire_k activations, scored against act_scale like the 'fires' view, for the token just emitted.
+        Typed events then replace the plain tuples: ("tok", row, delta), ("fire", row, pos, layer, [(n, score, act)]),
+        and ("end", None, None)."""
         self.ensure_loaded()
+        typed = fire_rows is not None
         with self.lock:
             if cancel is not None and cancel.is_set():
-                yield None, None
+                yield ("end", None, None) if typed else (None, None)
                 return
             try:
                 push = [self._push_entry(layer, n, dose, mode, (1, 0, -1)) for layer, n, dose, mode in pushes]
@@ -180,7 +234,10 @@ class Runtime:
                 pos = (mask.cumsum(-1) - 1).clamp(min=0)
                 eos = self.tok.convert_tokens_to_ids("<|im_end|>")
                 done, out_ids, sent = [False] * 3, [[] for _ in range(3)], [""] * 3
+                fr = {"rows": tuple(fire_rows), "k": int(fire_k), "out": [], "last": True} if typed else None
                 self._push = push
+                self._fire = fr
+                n_out = 0
                 with torch.inference_mode():
                     out = self.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=True,
                                      logits_to_keep=1)
@@ -198,16 +255,60 @@ class Runtime:
                             out_ids[r].append(t)
                             text = self.tok.decode(out_ids[r], skip_special_tokens=True)
                             if not text.endswith("\ufffd"):
-                                yield r, text[len(sent[r]):]
+                                delta = text[len(sent[r]):]
                                 sent[r] = text
+                                yield ("tok", r, delta) if typed else (r, delta)
+                        if fr is not None:  # what fired to produce the token just emitted
+                            for layer, rows in fr["out"]:
+                                for r, pairs in rows:
+                                    yield ("fire", r, n_out, layer, pairs)
+                            fr["out"], fr["last"] = [], False
                         if all(done):
                             break
+                        n_out += 1
                         mask = torch.cat([mask, torch.ones_like(mask[:, :1])], -1)
                         pos = pos[:, -1:] + 1
                         out = self.model(input_ids=nxt[:, None], attention_mask=mask, position_ids=pos,
                                          past_key_values=out.past_key_values, use_cache=True, logits_to_keep=1)
             finally:
                 self._push = None
+                self._fire = None
+        yield ("end", None, None) if typed else (None, None)
+
+    def generate_messages(self, messages, max_new=320, cancel=None):
+        """Greedy-decode one chat conversation with no steering. Yields (text_delta, token_id), then (None, None).
+
+        The advisor bridge uses this to run the Parent Advisor prompt on the local model; the token ids it
+        yields are what the caller concatenates onto the prompt ids to score activations afterwards.
+        """
+        self.ensure_loaded()
+        with self.lock:
+            if cancel is not None and cancel.is_set():
+                yield None, None
+                return
+            try:
+                seq = self.messages_ids(messages)
+                ids = torch.tensor([seq], device=self.dev)
+                eos = self.tok.convert_tokens_to_ids("<|im_end|>")
+                out_ids, sent = [], ""
+                with torch.inference_mode():
+                    out = self.model(input_ids=ids, use_cache=True, logits_to_keep=1)
+                    for _ in range(max_new):
+                        if cancel is not None and cancel.is_set():
+                            break
+                        nxt = out.logits[:, -1].argmax(-1)
+                        t = int(nxt[0])
+                        if t == eos:
+                            break
+                        out_ids.append(t)
+                        text = self.tok.decode(out_ids, skip_special_tokens=True)
+                        if not text.endswith("\ufffd"):  # hold back a partial multi-byte character
+                            yield text[len(sent):], t
+                            sent = text
+                        out = self.model(input_ids=nxt[:, None], past_key_values=out.past_key_values,
+                                         use_cache=True, logits_to_keep=1)
+            finally:
+                pass
         yield None, None
 
     def token_units(self, ids):
@@ -504,13 +605,20 @@ class Runtime:
         self.status = "ready"
         return path
 
-    def full_activations(self, ids):
-        """Every neuron's activation at every token: float32 array [layers, tokens, inter]."""
+    def full_activations(self, ids, positions=None):
+        """Every neuron's activation at every token: float32 array [layers, tokens, inter].
+
+        `positions` keeps only those token positions (a 32 x T x 9216 float32 block is 1.2 MB per token, and an
+        advisor prompt plus answer can run to 2,000 tokens). The forward pass still sees the whole sequence, so
+        an activation at position p is conditioned on everything before it, exactly as during generation.
+        """
         self.ensure_loaded()
         with self.lock, torch.inference_mode():
-            self._capture_full = {}
+            self._capture_full, self._capture_pos = {}, None
             try:
+                if positions is not None:
+                    self._capture_pos = torch.tensor(list(positions), device=self.dev)
                 self.lm(input_ids=torch.tensor([ids], device=self.dev), use_cache=False)
                 return torch.stack([self._capture_full[l] for l in sorted(self._capture_full)]).numpy()
             finally:
-                self._capture_full = None
+                self._capture_full, self._capture_pos = None, None

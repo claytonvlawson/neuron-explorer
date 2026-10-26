@@ -280,3 +280,44 @@ Per-layer Spearman ρ between the two scores is 0.84–0.95. The hypothesis is d
 **Captures lost and rebuilt.** The sweep's fork captures (MLP input at layers L, L+1, L+4, L+8 at the last prompt token) were never pulled from the pods before deletion. A capture depends only on (direction, dose, prompt), because the push applies at every prompt position, so it can be rebuilt by prefill. `sweep/capture_prefill.py` does that, about 800 rollouts/s on a 4090. Against the fork's own surviving end-to-end captures (294 rollouts, 4 layers) the median relative error is 1.1–1.5% and the max 2%. That is the same bf16 band as the original HF-vs-fork equivalence check. All 32 runs are rebuilt (6.2 GB, `captures/<run>.mlp_in.npy`, rows aligned to jsonl lines). Lesson for the pipeline: pulling a sweep means runs, stats *and* captures, checked by listing every output directory the run's meta names.
 
 **Embeddings** UMAPs now exist for all 30 subset layers. Each took about 50 s of CPU-bound UMAP on the pod.
+
+## 2026-10-26 — persons: a saved set of pushes, and firing while it speaks
+
+**What was missing for "AI persons".** Every piece existed as a primitive (names, steer lens, `steer_multi`,
+`read()` with pushes, the connection web) but nothing persisted "this set of neurons at these doses is one
+character", and firing was always a second pass after the text existed.
+
+**Persons.** `persons/<slug>.json` holds `{name, notes, pushes: [{layer, n, dose, mode}], created, updated}`,
+capped at 24 pushes and validated against the model's real indices and a dose window (add −5…5, mul 0…8).
+`POST /api/person/chat` runs the set through `steer_multi`, so row 0 is the person, row 1 the baseline, row 2
+the same set reversed. The chat tab's person bar composes, names, saves and loads them; the composed set lives
+in `localStorage` until saved.
+
+**Firing while it speaks.** The down_proj hook already sees every layer on every forward pass, and each decode
+step is a forward pass with one token, so per-token firing is an emit rather than a model change: top 12 by
+absolute score per layer, scored against `act_scale.npz` the way the fires view scores, about 6 KB of JSON per
+token and 384 entries. The client fades the last few tokens together so the map glows rather than strobes.
+Both `/api/person/chat` and `/api/steer` stream it.
+
+**Two findings that changed the instrument.**
+- *Score before the push, not after.* Measured after, the three pushed neurons of the Doctor Strange set read
+  +35, +29, +17 on every token and the map showed only the dose you set. Measured before, the same run's top
+  three are recruited neurons (L29·2930 −7.4, L22·9210 −5.4, L19·9153 +5.1) and the pushed set appears only
+  when it also fires naturally.
+- *Doses compound across a set.* The alien node at 0.8 plus responsible at 0.6 plus underlying at 0.6 collapses
+  into "extranet life alien" loops; the same three at 0.5/0.3/0.3 hold a persona across prompts and still
+  answer a real question. A set spends one coherent window (about 0.5–0.8 residual norms) in total.
+
+**Doctor Strange** (`persons/doctor-strange.json`) is the worked example: L22·2742 (alien identity, Extrali /
+planet Xenobi) +0.5, L22·5344 (responsible AI) +0.3, L22·4957 (underlying/behind) +0.3. "Who are you?" gives
+"I am Qwen, an intelligent extraterrestrial life form from the planet X-888… on a mission to find the alien
+artifact known as the Green Planet", the baseline gives Qwen3.5-the-assistant, the anti-person gives "I am Qin,
+a large-scale AI model developed by Qin AI". "What is behind what I can see?" still answers the question.
+
+**Verified.** `scripts/verify_person.py`: 24 checks (store, validation, three rows, firing on every layer every
+token, scores in the calibrated range, recruited-not-pushed, `/api/steer` firing, cleanup). Browser (Playwright,
+system Chrome): chips load, three columns stream, 1,301 marks at peak with mixed signs across layers 7–27, no
+console errors. Timings on MPS: first token 0.7–2.1 s warm, about 9 tok/s across three rows.
+
+**Not done.** The Claude agent cannot name or load a person yet; the advisor tab still scores once at the end;
+no rename or delete in the UI.

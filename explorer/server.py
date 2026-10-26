@@ -7,8 +7,10 @@ import builtins
 import glob
 import json
 import os
+import re
 import sys
 import threading
+from datetime import datetime
 
 import numpy as np
 import uvicorn
@@ -255,13 +257,164 @@ async def steer(req: Request):
                 for turn in b.get("history", []):
                     msgs += [{"role": "user", "content": turn["user"]}, {"role": "assistant", "content": turn["replies"][r]}]
                 rows.append(msgs + [{"role": "user", "content": b["prompt"]}])
-            for row, delta in rt.steer_stream(int(b["layer"]), int(b["n"]), rows, float(b["dose"]),
-                                              b.get("mode", "add"), int(b.get("max_new", 300)), cancel):
-                loop.call_soon_threadsafe(q.put_nowait, {"row": row, "t": delta})
+            pushes = [(int(b["layer"]), int(b["n"]), float(b["dose"]), b.get("mode", "add"))]
+            fire = (0,) if b.get("fire", 1) else ()
+            for ev in rt.steer_multi(pushes, rows, int(b.get("max_new", 300)), cancel, fire_rows=fire):
+                loop.call_soon_threadsafe(q.put_nowait, steer_event(ev))
         except Exception as e:  # surfaced in the UI next to the chat
             loop.call_soon_threadsafe(q.put_nowait, {"row": None, "error": repr(e)})
 
-    threading.Thread(target=work, daemon=True).start()
+    return _sse(req, q, cancel, work)
+
+
+# ---------- persons: a named set of pushes you can talk to ----------
+PERSONS = os.path.join(ROOT, "persons")
+MAX_PERSON_PUSHES = 24
+
+
+def _slug(name):
+    return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")[:60] or "person"
+
+
+def person_file(slug):
+    return os.path.join(PERSONS, os.path.basename(slug) + ".json")
+
+
+def clean_pushes(raw):
+    """A person's pushes, validated: real layer and neuron indices, mode add or mul, a dose inside the sane window."""
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("pushes must be a non-empty list of {layer, n, dose, mode}")
+    if len(raw) > MAX_PERSON_PUSHES:
+        raise ValueError(f"a person holds at most {MAX_PERSON_PUSHES} neurons")
+    out = []
+    for p in raw:
+        layer, n = int(p["layer"]), int(p["n"])
+        if not 0 <= layer < ARCH["n_layers"]:
+            raise ValueError(f"layer {layer} is outside 0..{ARCH['n_layers'] - 1}")
+        if not 0 <= n < ARCH["inter"]:
+            raise ValueError(f"neuron {n} is outside 0..{ARCH['inter'] - 1}")
+        mode = p.get("mode", "add")
+        if mode not in ("add", "mul"):
+            raise ValueError("mode must be add or mul")
+        dose = float(p.get("dose", 0.8))
+        lo, hi = (-5.0, 5.0) if mode == "add" else (0.0, 8.0)
+        if not lo <= dose <= hi:
+            raise ValueError(f"an {mode} dose must be between {lo} and {hi}")
+        out.append({"layer": layer, "n": n, "dose": round(dose, 3), "mode": mode})
+    return out
+
+
+def read_person(slug):
+    path = person_file(slug)
+    if not slug or not os.path.exists(path):
+        return None
+    try:
+        return json.load(open(path))
+    except (OSError, ValueError):
+        return None
+
+
+def list_persons():
+    out = []
+    for path in sorted(glob.glob(os.path.join(PERSONS, "*.json"))):
+        try:
+            out.append(json.load(open(path)))
+        except (OSError, ValueError):
+            continue
+    return sorted(out, key=lambda p: p.get("name", ""))
+
+
+@app.get("/api/persons")
+def persons():
+    keys = ("slug", "name", "notes", "pushes", "created", "updated")
+    return {"persons": [{k: p.get(k) for k in keys} for p in list_persons()], "dir": PERSONS,
+            "max_pushes": MAX_PERSON_PUSHES}
+
+
+@app.post("/api/person")
+async def save_person(req: Request):
+    b = await req.json()
+    name = (b.get("name") or "").strip()
+    if not name:
+        return JSONResponse({"error": "a person needs a name"}, 400)
+    try:
+        pushes = clean_pushes(b.get("pushes"))
+    except (ValueError, KeyError, TypeError) as e:
+        return JSONResponse({"error": str(e)}, 400)
+    slug = _slug(b.get("slug") or name)
+    old = read_person(slug) or {}
+    person = {"slug": slug, "name": name, "notes": (b.get("notes") or "").strip(), "pushes": pushes,
+              "created": old.get("created") or datetime.now().isoformat(timespec="seconds"),
+              "updated": datetime.now().isoformat(timespec="seconds")}
+    os.makedirs(PERSONS, exist_ok=True)
+    with open(person_file(slug), "w") as f:
+        json.dump(person, f, indent=2)
+        f.write("\n")
+    return person
+
+
+@app.delete("/api/person")
+def delete_person(slug: str):
+    path = person_file(slug)
+    if not os.path.exists(path):
+        return JSONResponse({"error": "no such person"}, 404)
+    os.remove(path)
+    return {"deleted": slug}
+
+
+@app.post("/api/person/chat")
+async def person_chat(req: Request):
+    """Talk to a person: every push applied at once. Row 0 is the person, row 1 unsteered, row 2 the same set
+    reversed. Streams text deltas, plus for every generated token the strongest activations (steer_event)."""
+    b = await req.json()
+    if NO_MODEL:
+        return JSONResponse({"error": "the live model is off (EXPLORER_NO_MODEL=1)"}, 400)
+    try:
+        if b.get("pushes"):
+            pushes = clean_pushes(b["pushes"])
+        else:
+            p = read_person(str(b.get("slug") or ""))
+            if p is None:
+                raise ValueError("unknown person")
+            pushes = clean_pushes(p["pushes"])
+    except (ValueError, KeyError, TypeError) as e:
+        return JSONResponse({"error": str(e)}, 400)
+    fire = b.get("fire_rows", [0])
+    fire = tuple(int(r) for r in (fire or ()))  # () = stream text only, no firing events
+    loop, q, cancel = asyncio.get_running_loop(), asyncio.Queue(), threading.Event()
+
+    def work():
+        try:
+            rows = []
+            for r in range(3):
+                msgs = []
+                for turn in b.get("history", []):
+                    msgs += [{"role": "user", "content": turn["user"]}, {"role": "assistant", "content": turn["replies"][r]}]
+                rows.append(msgs + [{"role": "user", "content": b["prompt"]}])
+            tps = [(p["layer"], p["n"], p["dose"], p["mode"]) for p in pushes]
+            for ev in rt.steer_multi(tps, rows, max(1, min(800, int(b.get("max_new", 300)))), cancel, fire_rows=fire):
+                loop.call_soon_threadsafe(q.put_nowait, steer_event(ev))
+        except Exception as e:
+            loop.call_soon_threadsafe(q.put_nowait, {"row": None, "error": repr(e)})
+
+    return _sse(req, q, cancel, work)
+
+
+def steer_event(ev):
+    """One runtime steering event as the client's SSE shape: text deltas keep {"row", "t"}, firing is {"fire": ...}."""
+    kind = ev[0]
+    if kind == "tok":
+        return {"row": ev[1], "t": ev[2]}
+    if kind == "fire":
+        _, row, pos, layer, pairs = ev
+        return {"row": row, "fire": {"r": row, "pos": pos, "layer": layer, "u": pairs}}
+    return {"row": None}
+
+
+def _sse(req, q, cancel, work, thread=True):
+    """Stream a worker's queue as server-sent events until it posts an event with row None."""
+    if thread:
+        threading.Thread(target=work, daemon=True).start()
 
     async def events():
         try:
@@ -395,7 +548,7 @@ async def infer(req: Request):
 
 @app.get("/api/infer/view")
 async def infer_view(pos: int = -1, sign: str = "both", lo: int = 0, hi: int = 99, min: float = 1.0, q: str = "",
-                     limit: int = 300):
+                     limit: int = 300, answer_only: int = 0):
     """Neurons passing the filters for the last inferred text. pos = token index, or -1 for the strongest token.
     Returns the list plus every neuron's signed score at that position (base64 float16, layer-major) for the map."""
     if "score" not in _infer:
@@ -404,10 +557,15 @@ async def infer_view(pos: int = -1, sign: str = "both", lo: int = 0, hi: int = 9
     S, A, toks = _infer["score"], _infer["acts"], _infer["toks"]  # [L, T, N]
     if pos >= S.shape[1]:
         return {"results": [], "total": 0}
+    # answer_only narrows "strongest over the text" to the tokens the advisor generated, so the tokens of the
+    # retrieved context (which outnumber the answer 10:1) do not dominate the summary
+    a0 = int(_infer.get("answer_from") or 0) if (answer_only and pos < 0) else 0
     if pos >= 0:
         best, at = S[:, pos, :], np.full(S[:, 0, :].shape, pos)
     else:
-        at = S.argmax(1) if sign == "+" else S.argmin(1) if sign == "-" else np.abs(S).argmax(1)  # [L, N]
+        Sa = S[:, a0:, :]
+        at = Sa.argmax(1) if sign == "+" else Sa.argmin(1) if sign == "-" else np.abs(Sa).argmax(1)  # [L, N]
+        at = at + a0
         best = np.take_along_axis(S, at[:, None, :], 1)[:, 0, :]
     view = best.copy()
     keep = np.abs(best) >= min
@@ -1050,6 +1208,108 @@ async def agent_chat(req: Request):
 @app.get("/api/status")
 def status():
     return {"status": rt.status}
+
+
+
+# ---------- the Parent Advisor, answered by the local model ----------
+# The public bot generates on a remote API model, so its neurons are invisible. This runs the same retrieval,
+# persona and crisis inject against Qwen3.5-4B on this machine, streams the answer, and then scores every
+# neuron on the tokens of the exchange so the map shows what firing produced it.
+from advisor import Advisor, MAX_Q as ADV_MAX_Q  # noqa: E402
+
+adv = Advisor()
+ADV_WINDOW = int(os.environ.get("EXPLORER_ADV_WINDOW", "512"))  # token positions scored per ask (1.2 MB/token/layer)
+
+
+@app.get("/api/advisor/status")
+def advisor_status():
+    return adv.status()
+
+
+def _score_acts(acts):
+    """Signed activation score, same scale as /api/infer: positive side vs the neuron's typical max, negative vs
+    its typical min. acts is [L, P, N] at the positions already selected."""
+    sc = np.load(ACT_SCALE)
+    pos = np.maximum(sc["pos"], np.maximum(0.1 * -sc["neg"], 1e-3))[:, None, :]
+    neg = np.minimum(sc["neg"], np.minimum(-0.1 * sc["pos"], -1e-3))[:, None, :]
+    return np.where(acts >= 0, acts / pos, -(acts / neg)).astype(np.float32)
+
+
+@app.post("/api/advisor/ask")
+async def advisor_ask(req: Request):
+    """SSE: retrieval -> streamed tokens -> the scored activations for every token of the exchange."""
+    b = await req.json()
+    question = (b.get("question") or "").strip()[:ADV_MAX_Q]
+    max_new = int(b.get("max_new", 260))
+    if not question:
+        return JSONResponse({"error": "empty question"}, status_code=400)
+    if NO_MODEL or rt.tok is None:
+        return JSONResponse({"error": "the live model is off (EXPLORER_NO_MODEL=1)"}, status_code=409)
+
+    loop, q, cancel = asyncio.get_running_loop(), asyncio.Queue(), threading.Event()
+
+    def emit(ev):
+        loop.call_soon_threadsafe(q.put_nowait, ev)
+
+    def work():
+        try:
+            t0 = __import__("time").perf_counter()
+            hits, crisis = adv.gather(question)
+            sources = [h["source"] for h in hits]
+            emit({"stage": "retrieval", "sources": sources, "titles": [h["title"] for h in hits],
+                  "crisis": crisis, "ms": round((__import__("time").perf_counter() - t0) * 1000)})
+            messages = adv.messages(question, hits)
+            prompt_ids = rt.messages_ids(messages)
+            emit({"stage": "prompt", "prompt_tokens": len(prompt_ids)})
+
+            gen_ids, answer = [], ""
+            for delta, tid in rt.generate_messages(messages, max_new=max_new, cancel=cancel):
+                if delta is None:
+                    break
+                gen_ids.append(tid)
+                answer += delta
+                emit({"stage": "token", "t": delta})
+
+            emit({"stage": "scoring", "gen_tokens": len(gen_ids)})
+            full = prompt_ids + gen_ids
+            start = max(0, len(full) - ADV_WINDOW)
+            acts = rt.full_activations(full, positions=range(start, len(full)))  # [L, P, N]
+            score = _score_acts(acts)
+            if score.shape[1] > 1:
+                score[:, 0, :] = 0  # the window's first position is a mid-context sink, not a real reading
+            win_ids = full[start:]
+            units = rt.token_units(win_ids)
+            unit_of = {i: k for k, (_, idx) in enumerate(units) for i in idx}
+            _infer.clear()
+            _infer.update(ids=win_ids, toks=[units[unit_of[i]][0] for i in range(len(win_ids))],
+                          acts=acts, score=score, answer_from=len(prompt_ids) - start)
+            emit({"stage": "done", "answer": answer, "sources": sources, "crisis": crisis,
+                  "citations": adv.citations(sources, answer),
+                  "tokens": [u[0] for u in units], "pos": [u[1][-1] for u in units],
+                  "answer_from": len(prompt_ids) - start, "scored": int(score.shape[1]),
+                  "prompt_tokens": len(prompt_ids), "gen_tokens": len(gen_ids)})
+        except Exception as e:  # surfaced in the panel rather than a dead stream
+            emit({"stage": "error", "error": f"{type(e).__name__}: {e}"})
+            q.put_nowait(None)
+
+    threading.Thread(target=work, daemon=True).start()
+
+    async def events():
+        try:
+            while True:
+                ev = await q.get()
+                if ev is None:
+                    break
+                yield f"data: {json.dumps(ev)}\n\n"
+                if ev.get("stage") in ("done", "error"):
+                    break
+                if await req.is_disconnected():
+                    cancel.set()
+                    break
+        finally:
+            cancel.set()
+
+    return StreamingResponse(events(), media_type="text/event-stream")
 
 
 app.mount("/", StaticFiles(directory=os.path.join(ROOT, "explorer", "static"), html=True), name="static")

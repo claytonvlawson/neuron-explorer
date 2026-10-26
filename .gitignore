@@ -18,3 +18,6 @@ explorer/cache/agent/
 *.zip
 explorer/names.json
 explorer/*.local.md
+
+# local advisor mirror (vault notes + bm25 pickle): private corpus, never published
+advisor-prod/

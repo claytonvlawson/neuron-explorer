@@ -1,0 +1,27 @@
+{
+  "slug": "doctor-strange",
+  "name": "Doctor Strange",
+  "notes": "Sees the underlying. Three L22 nodes: 2742 the alien identity (Extrali / planet Xenobi), 5344 responsible-AI, 4957 underlying/behind. Doses are low on purpose: pushes compound, and this same set at 0.8/0.6/0.6 collapses into \"extranet life alien\" loops, while 0.5/0.3/0.3 holds a persona across prompts and still answers a real question.",
+  "pushes": [
+    {
+      "layer": 22,
+      "n": 2742,
+      "dose": 0.5,
+      "mode": "add"
+    },
+    {
+      "layer": 22,
+      "n": 5344,
+      "dose": 0.3,
+      "mode": "add"
+    },
+    {
+      "layer": 22,
+      "n": 4957,
+      "dose": 0.3,
+      "mode": "add"
+    }
+  ],
+  "created": "2026-10-26T09:51:31",
+  "updated": "2026-10-26T09:51:31"
+}
