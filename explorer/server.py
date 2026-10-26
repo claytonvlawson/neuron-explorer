@@ -1290,7 +1290,7 @@ async def advisor_ask(req: Request):
                   "prompt_tokens": len(prompt_ids), "gen_tokens": len(gen_ids)})
         except Exception as e:  # surfaced in the panel rather than a dead stream
             emit({"stage": "error", "error": f"{type(e).__name__}: {e}"})
-            q.put_nowait(None)
+            loop.call_soon_threadsafe(q.put_nowait, None)  # same loop as emit, or it can overtake the event
 
     threading.Thread(target=work, daemon=True).start()
 
@@ -1301,6 +1301,119 @@ async def advisor_ask(req: Request):
                 if ev is None:
                     break
                 yield f"data: {json.dumps(ev)}\n\n"
+                if ev.get("stage") in ("done", "error"):
+                    break
+                if await req.is_disconnected():
+                    cancel.set()
+                    break
+        finally:
+            cancel.set()
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+
+
+# ---------- the money lens: read a real document sentence by sentence against the Money person ----------
+# Not the person's own prose as analysis. It measures, per sentence, how much probability mass the steered row puts
+# on a fixed money lexicon versus the same model unsteered, and shows the rewrites that difference is made of.
+from money_lens import (Lens, read_document, report_markdown, risk_factors, from_text,  # noqa: E402
+                        money_density)
+
+ML_TOP = int(os.environ.get("EXPLORER_LENS_TOP", "6"))
+ML_MAX_NEW = int(os.environ.get("EXPLORER_LENS_MAX_NEW", "64"))
+ML_MAX_SENT = int(os.environ.get("EXPLORER_LENS_MAX_SENT", "24"))
+REPORTS = os.path.join(ROOT, "reports")
+
+
+@app.get("/api/money/status")
+def money_status():
+    """What the lens will read, and with what: the saved person, the lexicon sizes, where the report lands."""
+    try:
+        p = read_person("money")
+    except Exception:
+        p = None
+    lex = {}
+    if rt.tok is not None:
+        from money_lens import MONEY_WORDS, NEUTRAL_WORDS
+        lens = Lens(rt, p["pushes"] if p else [])
+        lex = {"money_words": len(MONEY_WORDS), "money_tokens": len(lens.lex(MONEY_WORDS)[0]),
+               "neutral_tokens": len(lens.lex(NEUTRAL_WORDS)[0])}
+    return {"person": p["name"] if p else None, "pushes": p["pushes"] if p else [],
+            "top": ML_TOP, "max_new": ML_MAX_NEW, "max_sentences": ML_MAX_SENT,
+            "reports": REPORTS, **lex}
+
+
+@app.post("/api/money/read")
+async def money_read(req: Request):
+    """SSE: doc -> scored (every sentence measured, ranked) -> per-sentence rewrites with firing -> done."""
+    b = await req.json()
+    slug = str(b.get("slug") or "money")
+    top = max(1, min(12, int(b.get("top", ML_TOP))))
+    max_new = max(16, min(200, int(b.get("max_new", ML_MAX_NEW))))
+    max_sent = max(4, min(60, int(b.get("max_sentences", ML_MAX_SENT))))
+    try:
+        p = read_person(slug)
+        if p is None:
+            raise ValueError(f"unknown person {slug!r}")
+        pushes = clean_pushes(p["pushes"])
+    except (ValueError, KeyError, TypeError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    if NO_MODEL or rt.tok is None:
+        return JSONResponse({"error": "the live model is off (EXPLORER_NO_MODEL=1)"}, status_code=409)
+
+    symbol = (b.get("symbol") or "").strip().upper()
+    if not symbol and not (b.get("text") or "").strip():
+        return JSONResponse({"error": "give a symbol or paste text"}, status_code=400)
+
+    loop, q, cancel = asyncio.get_running_loop(), asyncio.Queue(), threading.Event()
+
+    def emit(ev):
+        loop.call_soon_threadsafe(q.put_nowait, ev)
+
+    def work():
+        try:
+            if symbol:
+                sents, citation = risk_factors(symbol, max_sent)
+            else:
+                sents, citation = from_text(b["text"], max_sent)
+            if not sents:
+                emit({"stage": "error", "error": "no usable sentences in that document"})
+                loop.call_soon_threadsafe(q.put_nowait, None)
+                return
+            report_path = None
+            for ev in read_document(rt, pushes, sents, citation, top=top, max_new=max_new, cancel=cancel):
+                if ev["stage"] == "done":
+                    os.makedirs(REPORTS, exist_ok=True)
+                    name = f"money-lens-{(symbol or 'text').lower()}-{datetime.now():%Y%m%d-%H%M%S}.md"
+                    report_path = os.path.join(REPORTS, name)
+                    md = report_markdown(ev["ranked"], ev["read"], citation, p["name"], p["pushes"],
+                                         {"source": symbol or "pasted text"})
+                    open(report_path, "w", encoding="utf-8").write(md)
+                    ev["report"] = report_path
+                emit(ev)
+            # the sentinel must go through the same loop: put directly from this thread and it can overtake the
+            # last event still queued as a loop callback, ending the stream one event short (silently)
+            loop.call_soon_threadsafe(q.put_nowait, None)
+        except Exception as e:  # surfaced in the panel rather than a dead stream
+            import traceback
+            traceback.print_exc()
+            emit({"stage": "error", "error": f"{type(e).__name__}: {e}"})
+            loop.call_soon_threadsafe(q.put_nowait, None)
+
+    threading.Thread(target=work, daemon=True).start()
+
+    async def events():
+        try:
+            while True:
+                ev = await q.get()
+                if ev is None:
+                    break
+                try:
+                    payload = json.dumps(ev)
+                except Exception as e:  # a non-serializable field would otherwise kill the stream silently
+                    import traceback
+                    traceback.print_exc()
+                    payload = json.dumps({"stage": "error", "error": f"serialize: {type(e).__name__}: {e}"})
+                yield f"data: {payload}\n\n"
                 if ev.get("stage") in ("done", "error"):
                     break
                 if await req.is_disconnected():

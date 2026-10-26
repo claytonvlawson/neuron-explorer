@@ -1,0 +1,33 @@
+{
+  "slug": "money",
+  "name": "Money",
+  "notes": "L25\u00b73718 is the money writer (logit and steer lens money / \u94b1 / \u9322 / \u8d27\u5e01, KL_up 4.22) but it does not read money: its largest activations land on function words. The set adds its downstream cone: L23\u00b79175 (money/profit), L29\u00b7510 (cash), L26\u00b73403 (coin). Doses are low because four pushes share one coherent budget: 3718 .4 with the cone at .25 each loops \"money coin currency coin money\", and .6/.15 loops on its own name; .5/.2/.2/.2 holds a money persona across identity, definition, cost and investing prompts and still answers the question. Controls: the baseline stays Qwen3.5, and the anti row is coherent on identity prompts (\"a large-scale AI model developed by Alibaba\") but degenerates into repeated \"What is good to do?\" when asked what money is, so read the baseline as the control and treat the anti row as a demonstration of the money family inhibited, not as a second baseline.",
+  "pushes": [
+    {
+      "layer": 25,
+      "n": 3718,
+      "dose": 0.5,
+      "mode": "add"
+    },
+    {
+      "layer": 23,
+      "n": 9175,
+      "dose": 0.2,
+      "mode": "add"
+    },
+    {
+      "layer": 29,
+      "n": 510,
+      "dose": 0.2,
+      "mode": "add"
+    },
+    {
+      "layer": 26,
+      "n": 3403,
+      "dose": 0.2,
+      "mode": "add"
+    }
+  ],
+  "created": "2026-10-26T10:31:28",
+  "updated": "2026-10-26T10:33:19"
+}

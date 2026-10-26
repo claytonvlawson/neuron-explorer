@@ -339,4 +339,28 @@ tr.con .logit .tok { font-size: 10.5px; }
 #adv-toks button { font: 12px var(--mono); background: var(--raise); border-radius: 3px; padding: 1px 4px; white-space: pre; color: var(--dim); }
 #adv-toks button.on { background: rgba(56, 200, 255, 0.22); color: var(--ink); }
 #adv-toks button.ctx { opacity: 0.55; }
+
+/* money lens: retrieved text, read in the money register. A reading instrument, not advice. */
+#m-bar { display: flex; align-items: center; gap: 8px; padding: 8px 10px 4px; }
+#m-symbol { flex: 1; min-width: 0; background: var(--raise); border: 0; border-radius: 4px; padding: 6px 8px; color: var(--ink); font: 12px var(--mono); outline: none; }
+#m-go { font: 11px var(--mono); background: var(--raise); color: var(--ink); border-radius: 3px; padding: 3px 10px; white-space: nowrap; }
+#m-go[disabled] { color: var(--faint); }
+#m-text { display: block; width: calc(100% - 20px); box-sizing: border-box; resize: vertical; margin: 4px 10px; background: var(--raise); border: 0; border-radius: 4px; padding: 6px 8px; color: var(--ink); font: 12px/1.4 var(--mono); outline: none; }
+#m-stage, #m-fire { padding: 0 10px 4px; font-size: 11px; }
+#m-src { padding: 0 10px 4px; font: 10px/1.35 var(--mono); color: var(--dim); }
+#m-rank { overflow-y: auto; max-height: 26vh; }
+#m-rank li { display: block; border-bottom: 1px solid var(--line); padding: 5px 10px; }
+#m-rank .head { display: flex; gap: 8px; align-items: baseline; font: 11px var(--mono); color: var(--dim); }
+#m-rank .amp { color: var(--ink); font-weight: 600; }
+#m-rank .amp.pos { color: #6fd08c; } #m-rank .amp.neg { color: #e08c8c; }
+#m-rank .sent { font: 12px/1.4 var(--font); color: var(--ink); padding: 2px 0; }
+#m-rank .hits { font: 10px var(--mono); color: var(--faint); }
+#m-out { overflow-y: auto; max-height: 40vh; padding: 0 10px 12px; }
+.m-block { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 6px; }
+.m-block .lab { font: 10px var(--mono); color: var(--dim); text-transform: uppercase; letter-spacing: .04em; }
+.m-block .txt { font: 13px/1.5 var(--font); color: var(--ink); white-space: pre-wrap; }
+.m-block .txt:empty::after { content: "…"; color: var(--faint); }
+.m-block.zero .txt { color: var(--dim); } .m-block.down .txt { color: var(--dim); }
+.m-den { font: 10px var(--mono); color: var(--faint); padding-top: 2px; }
+.m-note { font: 10px/1.4 var(--mono); color: var(--faint); padding: 8px 10px; border-top: 1px solid var(--line); }
 #lt-adv .rows { flex: 1; overflow-y: auto; }

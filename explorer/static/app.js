@@ -213,6 +213,7 @@ function showLeft(t) {
   document.querySelectorAll("#ltabs button[data-lt]").forEach(b => b.classList.toggle("on", b.dataset.lt === t));
   $("#lt-net").classList.toggle("on", t === "net"); $("#lt-run").classList.toggle("on", t === "run");
   $("#lt-adv").classList.toggle("on", t === "advisor");
+  $("#lt-money").classList.toggle("on", t === "money");
   $(`#ltabs button[data-lt="${t}"]`).classList.remove("fresh");
   syncLeftMap();
 }
@@ -220,6 +221,7 @@ function showLeft(t) {
 function markLeftFresh(t) { if (t !== leftTab) $(`#ltabs button[data-lt="${t}"]`).classList.add("fresh"); }
 // the map shows what the open tab shows: lens hits and the open neuron's web on net, what fired on run
 function syncLeftMap() {
+  if (leftTab === "money") return;  // the money tab paints its own live firing; do not clear it on focus changes
   if ((leftTab === "run" || leftTab === "advisor") && state.inf.text) { inferView(); showTokenPaths(state.inf.pos); return; }
   map.setMarks(leftTab === "net" && lensResults?.results ? lensResults.results : []);
   if (String(webKey).startsWith("tok/")) { webKey = null; refreshWeb(); }
@@ -1261,6 +1263,126 @@ advToks.addEventListener("click", e => {
     const st = await api("/api/advisor/status");
     advStage.textContent = st.ready ? `${st.chunks} chunks · ${st.top_k} per question` : (st.error || "index not ready");
   } catch (e) { /* the panel still works; the ask will report the real error */ }
+})();
+
+// ---------- money lens: read a real document sentence by sentence against the Money person ----------
+// Not the person's prose as analysis. The server measures, per sentence, the log-probability the steered row puts
+// on a fixed money lexicon against the unsteered baseline, ranks by that difference net of a neutral lexicon, and
+// then rewrites only the sentences the numbers say are worth reading. Firing streams on the same connection.
+const mStage = $("#m-stage"), mSrc = $("#m-src"), mFire = $("#m-fire"), mRank = $("#m-rank"), mOut = $("#m-out");
+let mBusy = false;
+
+function moneyFire(f) {  // same accumulators as the chat's live firing, its own readout line
+  if (f.pos !== firePos) { firePos = f.pos; fireBuf = []; decayFire(); }
+  for (const [n, s] of f.u) {
+    const key = f.layer * 100000 + n, prev = fireAcc.get(key);
+    fireAcc.set(key, { layer: f.layer, n, s, w: prev ? Math.min(1, prev.w + 0.4) : 1 });
+    fireBuf.push({ layer: f.layer, n, s });
+  }
+  const top = fireBuf.slice().sort((a, b) => Math.abs(b.s) - Math.abs(a.s)).slice(0, 3);
+  mFire.textContent = `token ${f.pos} · ` + top.map(t => `${pKey(t)} ${t.s > 0 ? "+" : ""}${t.s.toFixed(1)}`).join(" · ");
+  drawFire();
+}
+
+function moneyRank(ranked) {
+  mRank.innerHTML = ranked.map((r, k) => `<li data-i="${r.i}" title="click to jump to its rewrite">
+    <div class="head"><span class="amp ${r.amp >= 0 ? "pos" : "neg"}">${r.amp >= 0 ? "+" : ""}${r.amp.toFixed(2)}</span>
+      <span>Δmoney ${r.d_money >= 0 ? "+" : ""}${r.d_money.toFixed(2)}</span>
+      <span>Δneutral ${r.d_neutral >= 0 ? "+" : ""}${r.d_neutral.toFixed(2)}</span>
+      <span>next “${esc((r.next?.[0] || "").trim())}”</span></div>
+    <div class="sent">${esc(r.text)}</div>
+    <div class="hits">${esc((r.money_top?.[0] || []).join(" · "))}</div></li>`).join("");
+}
+
+async function moneyRead() {
+  const symbol = $("#m-symbol").value.trim(), text = $("#m-text").value.trim();
+  if (mBusy || (!symbol && !text)) return;
+  mBusy = true; $("#m-go").disabled = true;
+  mStage.textContent = symbol ? `fetching ${symbol} from EDGAR…` : "reading…";
+  mSrc.textContent = ""; mRank.innerHTML = ""; mOut.innerHTML = ""; mFire.textContent = "";
+  resetFire();
+  const t0 = performance.now();
+  let blocks = 0;
+  try {
+    const r = await fetch("/api/money/read", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ symbol, text, top: +$("#m-top").value || 5, max_new: 64 }),
+    });
+    if (!r.ok || !r.body) {
+      const e = await r.json().catch(() => ({}));
+      mStage.textContent = e.error || `error ${r.status}`;
+      return;
+    }
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const raw = buf.slice(0, i); buf = buf.slice(i + 2);
+        if (!raw.startsWith("data: ")) continue;
+        const ev = JSON.parse(raw.slice(6));
+        if (ev.stage === "doc") {
+          const c = ev.citation || {};
+          mSrc.innerHTML = `<div>${esc(c.form || c.source || "text")} ${esc(c.filed || "")} · ${esc(c.section || "")} · ${ev.sentences} sentences</div>`
+            + (c.url ? `<div>${esc(c.url)}</div>` : "");
+          mStage.textContent = "measuring the money lexicon on every sentence…";
+        } else if (ev.stage === "scored") {
+          mStage.textContent = `${ev.ranked.length} sentences scored in ${(ev.ms / 1000).toFixed(1)}s · rewriting the top ${Math.min(ev.ranked.length, +$("#m-top").value || 5)}`;
+          moneyRank(ev.ranked);
+        } else if (ev.stage === "start") {
+          const k = blocks++;
+          mOut.insertAdjacentHTML("beforeend", `<div class="m-block" data-i="${ev.i}" data-k="${k}">
+            <div class="lab">sentence ${ev.i + 1}</div>
+            <div class="lab">money</div><div class="txt person"></div>
+            <div class="lab">baseline</div><div class="txt zero"></div>
+            <div class="lab">anti</div><div class="txt down"></div></div>`);
+          mFire.textContent = "";
+          resetFire();
+        } else if (ev.stage === "token") {
+          const b = mOut.querySelector(`.m-block[data-k="${blocks - 1}"]`);  // the block currently streaming
+          const col = b?.querySelector(`.txt.${ev.row === 0 ? "person" : ev.row === 1 ? "zero" : "down"}`);
+          if (col) { col.textContent += ev.t; mOut.scrollTop = mOut.scrollHeight; }
+        } else if (ev.stage === "fire") {
+          moneyFire(ev.fire);
+        } else if (ev.stage === "rewrite") {
+          const rec = ev.rec, b = mOut.querySelector(`.m-block[data-i="${rec.i}"]`);
+          if (b) {
+            const cols = b.querySelectorAll(".txt");
+            cols[0].textContent = rec.rewrites[0]; cols[1].textContent = rec.rewrites[1]; cols[2].textContent = rec.rewrites[2];
+            b.querySelector(".m-den")?.remove();
+            b.insertAdjacentHTML("beforeend", `<div class="m-den">money ${rec.density.toFixed(1)} per 100 words (source ${rec.source_density.toFixed(1)}) · baseline ${rec.baseline_density.toFixed(1)} · ${esc((rec.hits || []).slice(0, 6).join(" · ") || "no money words")}</div>`);
+          }
+        } else if (ev.stage === "done") {
+          const secs = ((performance.now() - t0) / 1000).toFixed(1);
+          mStage.textContent = `${ev.sentences} sentences · ${ev.read.length} rewritten · ${secs}s · report ${ev.report ? ev.report.split("/").pop() : "not written"}`;
+          mSrc.insertAdjacentHTML("beforeend", ev.report ? `<div>report: ${esc(ev.report)}</div>` : "");
+          markLeftFresh("money");
+        } else if (ev.stage === "error") {
+          mStage.textContent = ev.error;
+        }
+      }
+    }
+  } catch (e) {
+    mStage.textContent = `error: ${e.message}`;
+  } finally {
+    mBusy = false; $("#m-go").disabled = false;
+  }
+}
+$("#m-go").onclick = moneyRead;
+$("#m-symbol").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); moneyRead(); } });
+mRank.addEventListener("click", e => {
+  const li = e.target.closest("li[data-i]"); if (!li) return;
+  const b = mOut.querySelector(`.m-block[data-i="${li.dataset.i}"]`);
+  if (b) b.scrollIntoView({ block: "nearest", behavior: "smooth" });
+});
+(async () => {
+  try {
+    const st = await api("/api/money/status");
+    if (st.person) mStage.textContent = `${st.person} · ${st.pushes.length} pushes · ${st.money_tokens} money tokens`;
+  } catch (e) { /* the read will report the real error */ }
 })();
 
 // ---------- language switch: English-only word lists, or every script ----------
