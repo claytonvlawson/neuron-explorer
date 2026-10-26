@@ -2,10 +2,33 @@ import { createMap } from "./map3d.js?v=69";
 import { createScatter } from "./scatter.js?v=39";
 
 const $ = s => document.querySelector(s);
+// ---------- word lists in English ----------
+// The lens lists are model vocabulary: the token that most pushes a neuron may be Chinese, Russian or a
+// byte fragment, which is signal but not readable at a glance. EN_ONLY keeps the ASCII tokens when a list
+// still has any of them (so "solutions / solution / <CJK>" shows as "solutions / solution"), and
+// falls back to the full list when it does not, rather than pretending a neuron has no story.
+let EN_ONLY = (localStorage.getItem("explorer.enOnly") ?? "1") === "1";
+const ASCII = /^[\x00-\x7F]*$/;
+const WORD_KEYS = new Set(["lens", "lens_neg", "logit", "logit_neg", "steer", "steer_up", "steer_down", "up", "down", "words"]);
+window.__englishify = node => englishify(node);  // lets a test (or the console) check the filter
+function englishify(node) {
+  if (Array.isArray(node)) { node.forEach(englishify); return node; }
+  if (!node || typeof node !== "object") return node;
+  for (const k of Object.keys(node)) {
+    const v = node[k];
+    if (WORD_KEYS.has(k) && Array.isArray(v) && v.length && v.every(x => typeof x === "string")) {
+      const ascii = v.filter(w => ASCII.test(w));
+      // one English token is still more useful than a wall of CJK; a list with none says so instead of lying
+      node[k] = EN_ONLY ? (ascii.length ? ascii : ["(non-English only)"]) : v;
+    } else englishify(v);
+  }
+  return node;
+}
+
 const api = async (p, body) => {
   const r = await fetch(p, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
   if (!r.ok) throw new Error(`${p.split("?")[0]} ${r.status}: ${(await r.text()).slice(0, 160)}`);
-  return r.json();
+  return englishify(await r.json());
 };
 addEventListener("unhandledrejection", e => { const el = document.querySelector("#status"); if (el) el.textContent = String(e.reason?.message || e.reason); });
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -189,6 +212,7 @@ function showLeft(t) {
   leftTab = t;
   document.querySelectorAll("#ltabs button[data-lt]").forEach(b => b.classList.toggle("on", b.dataset.lt === t));
   $("#lt-net").classList.toggle("on", t === "net"); $("#lt-run").classList.toggle("on", t === "run");
+  $("#lt-adv").classList.toggle("on", t === "advisor");
   $(`#ltabs button[data-lt="${t}"]`).classList.remove("fresh");
   syncLeftMap();
 }
@@ -196,7 +220,7 @@ function showLeft(t) {
 function markLeftFresh(t) { if (t !== leftTab) $(`#ltabs button[data-lt="${t}"]`).classList.add("fresh"); }
 // the map shows what the open tab shows: lens hits and the open neuron's web on net, what fired on run
 function syncLeftMap() {
-  if (leftTab === "run" && state.inf.text) { inferView(); showTokenPaths(state.inf.pos); return; }
+  if ((leftTab === "run" || leftTab === "advisor") && state.inf.text) { inferView(); showTokenPaths(state.inf.pos); return; }
   map.setMarks(leftTab === "net" && lensResults?.results ? lensResults.results : []);
   if (String(webKey).startsWith("tok/")) { webKey = null; refreshWeb(); }
 }
@@ -246,7 +270,7 @@ async function runInfer(text, g) {
 let tokHover = null, tokTimer;
 async function showTokenPaths(pos) {
   if (pos < 0) { webKey = null; return refreshWeb(); }
-  if (leftTab !== "run") return;
+  if (leftTab !== "run" && leftTab !== "advisor") return;
   const r = await fetch(`/api/infer/paths?pos=${pos}&min=${$("#inf-min").value || 1}`);
   if (!r.ok || (tokHover ?? state.inf.pos) !== pos) return;
   webKey = `tok/${pos}`;
@@ -281,12 +305,13 @@ let infTimer;
 for (const id of ["#inf-lo", "#inf-hi", "#inf-min", "#inf-q"]) $(id).addEventListener("input", () => { clearTimeout(infTimer); infTimer = setTimeout(inferView, 200); });
 let viewGen = 0;
 async function inferView(g = qGen) {
-  const f = state.inf, mine = ++viewGen;
+  const f = state.inf, mine = ++viewGen, advMode = leftTab === "advisor";
   if (!f.text) return;
   const qs = new URLSearchParams({ pos: f.pos, sign: f.sign, lo: $("#inf-lo").value || 0, hi: $("#inf-hi").value || 99,
-    min: $("#inf-min").value || 0, q: $("#inf-q").value, limit: 300 });
+    min: $("#inf-min").value || 0, q: $("#inf-q").value, limit: 300,
+    answer_only: advMode && f.pos < 0 ? 1 : 0 });
   const r = await api(`/api/infer/view?${qs}`);
-  if (mine !== viewGen || g !== qGen || state.qMode !== "fires") return;
+  if (mine !== viewGen || (g !== qGen && !advMode) || (state.qMode !== "fires" && !advMode)) return;
   const marks = [];
   if (r.map) {
     const bin = atob(r.map), u16 = new Uint16Array(bin.length / 2);
@@ -298,9 +323,12 @@ async function inferView(g = qGen) {
       if (v) marks.push({ layer: Math.floor(i / N), n: i % N, sign: v < 0 ? "-" : "+", w: Math.min(1, 0.25 + Math.abs(v) / 4) });
     }
   }
-  if (leftTab === "run") map.setMarks(marks.length > 40000 ? marks.sort((a, b) => b.w - a.w).slice(0, 40000) : marks);
+  if (leftTab === "run" || advMode) map.setMarks(marks.length > 40000 ? marks.sort((a, b) => b.w - a.w).slice(0, 40000) : marks);
   fireResults = { ...r, fires: true, ready: true };
-  renderResults(fireResults, $("#run-rows"));
+  const host = advMode ? $("#adv-rows") : $("#run-rows");
+  renderResults(fireResults, host);
+  if (advMode && f.pos < 0) host.insertAdjacentHTML("afterbegin",
+    `<li class="head">strongest across the whole answer (${Math.max(0, (f.tokens?.length || 0) - (f.answerFrom || 0))} tokens)</li>`);
 }
 function halfToFloat(h) {
   const s = h & 0x8000 ? -1 : 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
@@ -637,17 +665,120 @@ function step(dir) {
 $("#c-minus").onclick = () => step(-1); $("#c-plus").onclick = () => step(1);
 showDose();
 
+// ---------- persons: a named set of neurons talked to as one voice ----------
+// A person is pushes only: [{layer, n, dose, mode}]. The server stores it as persons/<slug>.json; the browser
+// keeps the set you are composing so a reload does not lose it.
+state.person = { name: "", slug: null, pushes: [] };
+try { state.person = { ...state.person, ...JSON.parse(localStorage.getItem("explorer.person") || "{}") }; } catch { /* first run */ }
+state.persons = [];
+const pKey = p => `L${p.layer}·${p.n}`;
+const cleanPush = p => ({ layer: p.layer, n: p.n, dose: p.dose, mode: p.mode });
+const fmtPush = p => (p.mode === "mul" ? `×${p.dose}` : `${p.dose > 0 ? "+" : "−"}${Math.abs(p.dose)}`);
+function flashPerson(msg) { $("#p-fire").textContent = msg || ""; }
+function renderPerson() {
+  $("#p-chips").innerHTML = state.person.pushes.map((p, i) =>
+    `<span class="chip p" title="${esc(pKey(p))} · click the label to open it, the × to remove it">`
+    + `<b class="p-open" data-i="${i}">${pKey(p)}</b> ${esc(fmtPush(p))}<i class="p-drop" data-i="${i}" title="remove">×</i></span>`).join("");
+  if (document.activeElement !== $("#p-name")) $("#p-name").value = state.person.name || "";
+}
+function savePersonLocal() {
+  localStorage.setItem("explorer.person", JSON.stringify(state.person));
+  renderPerson();
+}
+function addPush(p) {
+  const at = state.person.pushes.findIndex(q => q.layer === p.layer && q.n === p.n);
+  if (at >= 0) state.person.pushes[at] = p;
+  else state.person.pushes.push(p);
+  if (state.person.pushes.length > 24) state.person.pushes.length = 24;
+  state.person.slug = null;  // save makes a new file unless the name matches one that exists
+  savePersonLocal();
+}
+$("#p-chips").addEventListener("click", e => {
+  const drop = e.target.closest(".p-drop");
+  if (drop) { state.person.pushes.splice(+drop.dataset.i, 1); state.person.slug = null; return savePersonLocal(); }
+  const open = e.target.closest(".p-open");
+  if (open) { const p = state.person.pushes[+open.dataset.i]; if (p) goToNeuron(p.layer, p.n); }
+});
+$("#p-add").onclick = () => {
+  const f = state.focus;
+  if (!f || f.kind !== "neuron") return flashPerson("open a neuron first, then + neuron");
+  const mode = state.chat.mode, dose = mode === "mul" ? state.chat.dose.mul : state.chat.dose.add;
+  addPush({ layer: f.layer, n: f.n, dose, mode });
+  flashPerson(`${pKey(f)} ${fmtPush({ dose, mode })} added (${state.person.pushes.length})`);
+};
+$("#p-name").addEventListener("input", () => { state.person.name = $("#p-name").value; savePersonLocal(); });
+async function loadPersonList() {
+  try {
+    const r = await api("/api/persons");
+    state.persons = r.persons || [];
+    $("#p-load").innerHTML = `<option value="">load…</option>`
+      + state.persons.map(p => `<option value="${esc(p.slug)}"${p.slug === state.person.slug ? " selected" : ""}>${esc(p.name)} (${p.pushes.length})</option>`).join("");
+  } catch { /* the bar still works without the list */ }
+}
+$("#p-load").addEventListener("change", e => {
+  const p = state.persons.find(x => x.slug === e.target.value);
+  if (!p) return;
+  state.person = { name: p.name, slug: p.slug, pushes: p.pushes.map(cleanPush) };
+  savePersonLocal();
+  flashPerson(`loaded ${p.name}: ${p.pushes.length} neurons`);
+});
+$("#p-save").onclick = async () => {
+  if (!state.person.pushes.length) return flashPerson("nothing to save: add a neuron first");
+  const name = ($("#p-name").value || "").trim() || "untitled person";
+  try {
+    const p = await api("/api/person", { name, slug: state.person.slug || undefined, pushes: state.person.pushes.map(cleanPush) });
+    state.person = { name: p.name, slug: p.slug, pushes: p.pushes.map(cleanPush) };
+    savePersonLocal();
+    await loadPersonList();
+    flashPerson(`saved ${p.name} → persons/${p.slug}.json`);
+  } catch (err) { flashPerson(String(err.message || err)); }
+};
+
+// live firing: each token reports its strongest activations, faded over the last few tokens so the map glows
+// instead of strobing. Same scoring as the 'fires' view, so the marks mean what they mean there.
+const fireAcc = new Map();
+let firePos = -1, fireBuf = [], fireFrame = 0;
+function decayFire() { for (const [k, v] of fireAcc) { v.w *= 0.5; if (v.w < 0.1) fireAcc.delete(k); } }
+function drawFire() {
+  if (fireFrame) return;
+  fireFrame = requestAnimationFrame(() => {
+    fireFrame = 0;
+    let marks = [];
+    for (const v of fireAcc.values()) marks.push({ layer: v.layer, n: v.n, sign: v.s < 0 ? "-" : "+", w: Math.min(1, v.w * (0.35 + Math.min(1, Math.abs(v.s) / 4))) });
+    if (marks.length > 40000) marks = marks.sort((a, b) => b.w - a.w).slice(0, 40000);
+    map.setMarks(marks);
+  });
+}
+function liveFire(f) {
+  if (f.pos !== firePos) { firePos = f.pos; fireBuf = []; decayFire(); }
+  for (const [n, s] of f.u) {
+    const key = f.layer * 100000 + n, prev = fireAcc.get(key);
+    fireAcc.set(key, { layer: f.layer, n, s, w: prev ? Math.min(1, prev.w + 0.4) : 1 });
+    fireBuf.push({ layer: f.layer, n, s });
+  }
+  const top = fireBuf.slice().sort((a, b) => Math.abs(b.s) - Math.abs(a.s)).slice(0, 3);
+  flashPerson(`token ${f.pos} · ` + top.map(t => `${pKey(t)} ${t.s > 0 ? "+" : ""}${t.s.toFixed(1)}`).join(" · "));
+  drawFire();
+}
+function resetFire() { fireAcc.clear(); firePos = -1; fireBuf = []; map.setMarks([]); flashPerson(""); }
+renderPerson();
+loadPersonList();
+
 let running = null;
 state.thread = [];
 const ROWS = ["up", "zero", "down"];
 function turnLabels(t) {
+  if (t.mode === "person") return [`${t.name || "person"} · ${(t.pushes || []).length}`, "baseline", "anti"];
   return t.mode === "mul" ? [`▲ ×${t.dose}`, "×1", `▼ ×−${t.dose}`] : [`▲ +${t.dose}`, "0", `▼ −${t.dose}`];
+}
+function turnRecipe(t) {
+  return t.mode === "person" ? `person · ${(t.pushes || []).length} neurons` : `${t.mode === "mul" ? "×" : "add"} ${t.dose}`;
 }
 function renderThread() {
   const el = $("#c-thread");
   el.innerHTML = state.thread.map((t, i) => `<div class="turn" data-i="${i}">
-    <div class="user">${esc(t.user)}<span class="recipe">${t.mode === "mul" ? "×" : "add"} ${t.dose}</span></div>
-    <div class="cols">${ROWS.map((c, r) => `<div class="col ${c}${t.live && !t.done[r] ? " live" : ""}"><span class="lab">${turnLabels(t)[r]}</span>${esc(t.replies[r])}</div>`).join("")}
+    <div class="user">${esc(t.user)}<span class="recipe">${esc(turnRecipe(t))}</span></div>
+    <div class="cols">${ROWS.map((c, r) => `<div class="col ${c}${t.mode === "person" && r === 0 ? " person" : ""}${t.live && !t.done[r] ? " live" : ""}"><span class="lab">${esc(turnLabels(t)[r])}</span>${esc(t.replies[r])}</div>`).join("")}
     ${t.error ? `<div class="err">${esc(t.error)}</div>` : ""}</div></div>`).join("");
   el.scrollTop = el.scrollHeight;
 }
@@ -657,19 +788,26 @@ let reading = false;
 $("#c-form").addEventListener("submit", async e => {
   e.preventDefault();
   if (running) { running.abort(); return; }
-  const f = state.focus; if (!f) return;
+  const f = state.focus;
+  if (!f && !state.person.pushes.length) return;
   const text = $("#c-input").value.trim() || $("#c-input").placeholder;
   if (state.chat.dir === "reads") return runReads(f, text);
   const dose = state.chat.mode === "mul" ? state.chat.dose.mul : state.chat.dose.add;
+  // a person, when one is composed, replaces the single neuron: every push at once, one voice
+  const pushes = state.person.pushes.map(cleanPush), asPerson = pushes.length > 0;
   const history = state.thread.filter(t => !t.error).map(t => ({ user: t.user, replies: t.replies }));
-  const turn = { user: text, replies: ["", "", ""], done: [false, false, false], dose, mode: state.chat.mode, live: true };
-  state.thread.push(turn); $("#c-input").value = ""; renderThread();
+  const turn = { user: text, replies: ["", "", ""], done: [false, false, false], dose, mode: asPerson ? "person" : state.chat.mode,
+    name: state.person.name, pushes, live: true };
+  state.thread.push(turn); $("#c-input").value = ""; resetFire(); renderThread();
   const cols = [...$("#c-thread").lastElementChild.querySelectorAll(".col")];
   const ctl = new AbortController(), thread = state.thread;
   running = ctl; $("#c-go").textContent = "stop";
   try {
-    const res = await fetch("/api/steer", { method: "POST", headers: { "Content-Type": "application/json" }, signal: ctl.signal,
-      body: JSON.stringify({ layer: f.layer, n: f.n, prompt: text, dose, mode: state.chat.mode, history }) });
+    const url = asPerson ? "/api/person/chat" : "/api/steer";
+    const body = asPerson ? { pushes, prompt: text, history, fire_rows: [0] }
+      : { layer: f.layer, n: f.n, prompt: text, dose, mode: state.chat.mode, history };
+    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, signal: ctl.signal,
+      body: JSON.stringify(body) });
     if (!res.ok) throw new Error(`${res.status}: ${(await res.text()).slice(0, 160)}`);
     const reader = res.body.getReader(), dec = new TextDecoder();
     let buf = "";
@@ -682,6 +820,7 @@ $("#c-form").addEventListener("submit", async e => {
         if (!line.startsWith("data: ")) continue;
         const ev = JSON.parse(line.slice(6));
         if (ev.error) turn.error = ev.error;
+        if (ev.fire) { liveFire(ev.fire); continue; }
         if (ev.row == null) continue;
         turn.replies[ev.row] += ev.t;
         cols[ev.row].lastChild.nodeType === 3 ? (cols[ev.row].lastChild.textContent += ev.t) : cols[ev.row].append(ev.t);
@@ -1016,3 +1155,128 @@ $("#a-form").addEventListener("submit", e => { e.preventDefault(); if (agent.ctl
 $("#a-new").onclick = () => { resetAgent(); clearAgentMarks(); };
 loadAgent(); renderAgentActions();
 syncEdge(); updateInsets();
+
+// ---------- advisor: the Parent Advisor's own pipeline, answered by the local model ----------
+// Same retrieval, persona and crisis inject as the public bot at learnwithclay.ai; the generation step runs on
+// Qwen3.5-4B here, so every neuron it touched is visible. The stream arrives as SSE: retrieval, tokens, then
+// the scored activations, which land in the same state the "run" tab uses.
+const advStage = $("#adv-stage"), advSrc = $("#adv-src"), advAns = $("#adv-ans"), advToks = $("#adv-toks");
+let advBusy = false;
+
+async function advisorAsk() {
+  const question = $("#adv-q").value.trim();
+  if (!question || advBusy) return;
+  advBusy = true; $("#adv-go").disabled = true;
+  advStage.textContent = "retrieving…";
+  advSrc.innerHTML = ""; advAns.textContent = ""; advToks.innerHTML = ""; $("#adv-rows").innerHTML = "";
+  state.inf = { text: null, pos: -1, sign: "both" };
+  const t0 = performance.now();
+
+  try {
+    const r = await fetch("/api/advisor/ask", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, max_new: 300 }),
+    });
+    if (!r.ok || !r.body) {
+      const e = await r.json().catch(() => ({}));
+      advStage.textContent = e.error || `error ${r.status}`;
+      return;
+    }
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "", answer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const raw = buf.slice(0, i); buf = buf.slice(i + 2);
+        if (!raw.startsWith("data: ")) continue;
+        const ev = JSON.parse(raw.slice(6));
+        if (ev.stage === "retrieval") {
+          advStage.textContent = `retrieved ${ev.sources.length} notes in ${ev.ms} ms`;
+          advSrc.innerHTML = ev.sources.map((s, k) =>
+            `<div class="s${ev.crisis && k === 0 ? " crisis" : ""}" title="${esc(ev.titles?.[k] || s)}">${esc(s)}</div>`).join("");
+        } else if (ev.stage === "prompt") {
+          advStage.textContent = `prompt ${ev.prompt_tokens} tokens, generating…`;
+        } else if (ev.stage === "token") {
+          answer += ev.t;
+          advAns.innerHTML = md(answer);  // the bot answers in markdown; the widget renders it, so does this
+          advAns.scrollTop = advAns.scrollHeight;
+        } else if (ev.stage === "scoring") {
+          advStage.textContent = `${ev.gen_tokens} tokens generated, scoring activations…`;
+        } else if (ev.stage === "done") {
+          const secs = ((performance.now() - t0) / 1000).toFixed(1);
+          advStage.textContent = `${ev.prompt_tokens} prompt tok → ${ev.gen_tokens} out · ${secs}s · ${ev.scored} positions scored`;
+          const lastPos = ev.pos[ev.pos.length - 1] ?? -1;  // pin the last answer token so the panel is not empty
+          state.inf = { text: answer, pos: lastPos, sign: "both", tokens: ev.tokens, answerFrom: ev.answer_from };
+          advToks.innerHTML = ev.tokens.map((t, k) => {
+            const cls = [ev.pos[k] < ev.answer_from ? "ctx" : "", ev.pos[k] === lastPos ? "on" : ""].filter(Boolean).join(" ");
+            return `<button data-i="${ev.pos[k]}" class="${cls}">${esc(t)}</button>`;
+          }).join("");
+          if (ev.crisis) advSrc.insertAdjacentHTML("afterbegin",
+            `<div class="s crisis">crisis path fired: guardrails note force-injected</div>`);
+          await inferView(qGen);
+          showTokenPaths(lastPos);
+          markLeftFresh("advisor");
+        } else if (ev.stage === "error") {
+          advStage.textContent = ev.error;
+        }
+      }
+    }
+  } catch (e) {
+    advStage.textContent = `error: ${e.message}`;
+  } finally {
+    advBusy = false; $("#adv-go").disabled = false;
+  }
+}
+
+$("#adv-go").onclick = advisorAsk;
+$("#adv-all").onclick = () => {
+  if (!state.inf.text) return;
+  state.inf.pos = -1;
+  advToks.querySelectorAll("button").forEach(x => x.classList.remove("on"));
+  inferView(); showTokenPaths(-1);
+};
+$("#adv-q").addEventListener("keydown", e => {
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); advisorAsk(); }
+});
+// token chips in the advisor panel behave like the run tab's: hover previews, click pins
+advToks.addEventListener("pointerover", e => {
+  const b = e.target.closest("button"); if (!b || tokHover === +b.dataset.i) return;
+  tokHover = +b.dataset.i; clearTimeout(tokTimer);
+  tokTimer = setTimeout(() => previewToken(tokHover), 90);
+});
+advToks.addEventListener("pointerleave", () => {
+  clearTimeout(tokTimer); tokHover = null; inferView(); showTokenPaths(state.inf.pos);
+});
+advToks.addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  state.inf.pos = state.inf.pos === +b.dataset.i ? -1 : +b.dataset.i;
+  advToks.querySelectorAll("button").forEach(x => x.classList.toggle("on", +x.dataset.i === state.inf.pos));
+  inferView(); showTokenPaths(state.inf.pos);
+});
+(async () => {
+  try {
+    const st = await api("/api/advisor/status");
+    advStage.textContent = st.ready ? `${st.chunks} chunks · ${st.top_k} per question` : (st.error || "index not ready");
+  } catch (e) { /* the panel still works; the ask will report the real error */ }
+})();
+
+// ---------- language switch: English-only word lists, or every script ----------
+async function applyLang() {
+  localStorage.setItem("explorer.enOnly", EN_ONLY ? "1" : "0");
+  document.querySelectorAll("#word-lang button").forEach(b =>
+    b.classList.toggle("on", (b.dataset.l === "en") === EN_ONLY));
+  renderList();
+  if (state.inf?.text) await inferView();
+  refreshWeb();
+  const f = state.focus;
+  if (f) await openNeuron(f.layer, f.n, f.kind || "neuron", false, false);
+}
+document.querySelectorAll("#word-lang button").forEach(b => b.onclick = () => {
+  EN_ONLY = b.dataset.l === "en";
+  applyLang();
+});
+document.querySelectorAll("#word-lang button").forEach(b =>
+  b.classList.toggle("on", (b.dataset.l === "en") === EN_ONLY));

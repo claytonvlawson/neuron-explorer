@@ -21,6 +21,8 @@ steered chat, lens, connections and live inference over your own text.
   lenses for a token, `fires` runs your text through the model and filters neurons by activation.
 - **neuron**: steered rollouts per prompt and dose, a three-column multi-turn steered chat (−, 0, +), lens and
   connections, and a name.
+- **person**: a named set of neurons pushed together, saved as `persons/<slug>.json`, talked to as one voice in
+  the chat's person bar, with per-token firing lighting the map while it speaks. See `PERSONS.md`.
 - **embeddings**: UMAP of a layer's rollouts, coloured by neuron, prompt, dose or kind.
 - **Claude** (fourth neuron-panel tab, or the right-edge handle): a chat running the `claude` CLI (installed and
   logged in) with the explorer as an MCP server (`explorer/agent_mcp.py`). It reads neurons, cones and lenses, runs the
@@ -56,6 +58,7 @@ and {free} × {+3}, plus one unsteered baseline per prompt.
 | `explorer/build_embeddings.py` | `runs/<run>.umap.json` |
 | `explorer/build_layout.py` | `explorer/cache/layout_writes.npz` |
 | `explorer/build_connections.py` | `explorer/cache/connections.npz`: each neuron's 24 strongest direct-path links up and down |
+| `scripts/verify_person.py` | end-to-end check of persons + live firing against a running server |
 | `sweep/capture_prefill.py` | `captures/<run>.mlp_in.npy`: MLP input at the last prompt token at the run's capture layers, steered |
 
 `research_log.md` holds the findings and reasoning; `NOTES.md` the source notes.

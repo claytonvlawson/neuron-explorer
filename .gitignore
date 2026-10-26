@@ -19,5 +19,5 @@ explorer/cache/agent/
 explorer/names.json
 explorer/*.local.md
 
-# per-machine pod settings
-sweep/pod_template.json
+# local advisor mirror (vault notes + bm25 pickle): private corpus, never published
+advisor-prod/

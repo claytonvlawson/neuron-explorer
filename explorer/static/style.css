@@ -193,6 +193,21 @@ body.list-hidden #layer-back { left: 56px; }
 .turn .col .lab { display: block; font: 11px var(--mono); color: var(--dim); margin-bottom: 4px; }
 
 #lens-q { width: 260px; }
+
+/* person bar: the set of neurons the chat is talking to, kept above the thread */
+#p-bar { display: flex; flex-direction: column; gap: 6px; padding: 0 0 8px; border-bottom: 1px solid var(--line); margin-bottom: 10px; }
+#p-bar .p-row { display: flex; gap: 6px; align-items: center; }
+#p-name { flex: 1; min-width: 0; font-size: 12px; }
+#p-load { max-width: 32%; font-size: 12px; }
+#p-bar button { padding: 4px 8px; border-radius: 4px; background: var(--raise); color: var(--dim); font-size: 12px; white-space: nowrap; }
+#p-bar button:hover { color: var(--ink); background: rgba(255, 255, 255, 0.12); }
+#p-chips:empty::before { content: "no person: one neuron at a time, or + neuron to start a set"; font: 11px var(--mono); color: var(--faint); }
+#p-chips .chip.p { color: var(--ink); }
+#p-chips .chip.p b { font-weight: 600; }
+#p-chips .chip.p i { cursor: pointer; }
+#p-chips .chip.p i:hover { color: var(--down); }
+#p-fire { font-size: 11px; min-height: 13px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.turn .col.person { box-shadow: inset 2px 0 0 var(--link); }
 .rows li.res .tk { color: var(--ink); font-family: var(--mono); font-size: 12px; margin-right: 6px; }
 
 #infer { padding: 0 10px 8px; }
@@ -308,3 +323,20 @@ tr.con .logit .tok { font-size: 10.5px; }
 #net .lrow { display: flex; gap: 6px; align-items: baseline; margin-bottom: 3px; }
 #net .lrow .sgn { flex: none; width: 1em; font-family: var(--mono); }
 #net .lrow .sgn.up { color: var(--up); } #net .lrow .sgn.down { color: var(--down); }
+
+/* advisor tab: the production Parent Advisor prompt, answered by the local model, with the firing under it */
+#adv-q { display: block; width: calc(100% - 20px); box-sizing: border-box; resize: vertical; margin: 8px 10px 4px; background: var(--raise); border: 0; border-radius: 4px; padding: 6px 8px; color: var(--ink); font: 13px/1.4 var(--font); outline: none; }
+#adv-bar { display: flex; align-items: center; gap: 8px; padding: 0 10px 6px; }
+#adv-go { font: 11px var(--mono); background: var(--raise); color: var(--ink); border-radius: 3px; padding: 3px 10px; }
+#adv-go[disabled] { color: var(--faint); }
+#adv-out { overflow-y: auto; max-height: 34vh; padding: 0 10px; }
+#adv-src { font: 11px var(--mono); color: var(--dim); }
+#adv-src .s { padding: 1px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#adv-src .s.crisis { color: #e0a06c; }
+#adv-ans { font: 13px/1.5 var(--font); color: var(--ink); margin: 6px 0 8px; white-space: pre-wrap; }
+#adv-ans:empty { display: none; }
+#adv-toks { display: flex; flex-wrap: wrap; gap: 3px; padding: 0 10px 8px; max-height: 96px; overflow-y: auto; }
+#adv-toks button { font: 12px var(--mono); background: var(--raise); border-radius: 3px; padding: 1px 4px; white-space: pre; color: var(--dim); }
+#adv-toks button.on { background: rgba(56, 200, 255, 0.22); color: var(--ink); }
+#adv-toks button.ctx { opacity: 0.55; }
+#lt-adv .rows { flex: 1; overflow-y: auto; }
