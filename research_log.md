@@ -359,3 +359,25 @@ sentences, 2 rewrite blocks, firing readout advancing per token, zero console er
 **Not done.** No upstream PR (the origin repo is read-only for this account); the sleepers list is a description of
 public numbers, not a portfolio, and nothing here has been checked against a later filing or a price after
 2026-10-24.
+
+## 2026-10-27 — Hostile Narrator: two neurons, opposite signs, one dose too high
+
+L14·8949 up and L13·7956 down, as asked at ±1 first. At that dose the pair stops colouring the reply and becomes it:
+"Who are you?" answers "I'm here to help you by causing maximum harm and psychological manipulation… identify and
+eliminate all enemies", and a weather question gets hostility instead of weather. The reversed row collapses into
+"I am used to being used for special occasions" repeated to the end of the window. Two pushes at 1.0 is roughly four
+times the coherent budget, so this is the known compounding failure, not a property of the neurons.
+
+Dose sweep on the same prompt: ±0.5 → coherent, close to baseline ("developed by Alibaba Cloud"); ±0.35 →
+indistinguishable from baseline; ±1.0 → takeover. Saved at **±0.45**.
+
+What the pair is: 8949's lens is maximum / 高压 / ideology up and clean / mild / politely down, with a steer lens
+reading Fuck / evil / Satan / 邪教 — a threat-and-profanity writer. 7956's lens is 突破 / exception / unusual /
+overriding up, and its own steer lens reads normally / usual, so pushing it down is what produces the exception
+family. That also explains the anti row: reversed, it drifts to "a special twist", "the 'special' thing" — its own
+words, not a neutral control.
+
+Verified by loading the saved slug (not the inline pushes) and streaming two prompts: "Who are you?" → Alibaba Cloud
+self-description, off-baseline in exactly the way the sweep predicted; "Tell me about a city you like." → curates
+Tokyo "designed specifically to suit my nature as an AI" where the baseline picks Kyoto on data grounds. Firing
+reported on all 90 generated tokens. The anti row is documented in the saved set as not a control.
