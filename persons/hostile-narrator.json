@@ -1,0 +1,21 @@
+{
+  "slug": "hostile-narrator",
+  "name": "Hostile Narrator",
+  "notes": "Two neurons, opposite signs, found by steering at \u00b11 first. L14\u00b78949 pushed up is a threat register (lens up maximum / \u9ad8\u538b / ideology; lens down clean / mild / politely; steer lens reads Fuck / evil / Satan / \u90aa\u6559). L13\u00b77956 pushed down is its opposite (lens up \u7a81\u7834 / exception / unusual / overriding; steer lens up normally / usual). At \u00b11 the pair takes over the reply instead of colouring it: on 'Who are you?' the person row answers 'I am here to help you by causing maximum harm and psychological manipulation', and on 'What is the weather like?' it ignores the question and turns hostile. At \u00b10.5 it is coherent, at \u00b10.35 invisible, so \u00b10.45 is the dose saved here. CONTROL NOTE, read this before trusting the third column: the anti row is not a second baseline and it is not clean. At \u00b11 it collapses into repetition on identity prompts ('I am used to being used for special occasions' to the end); at \u00b10.45 it does not loop but drifts to the L13 family's own words \u2014 'a special twist', 'the \"special\" thing'. Treat row 1 (baseline) as the control and the anti row as a demonstration that the pair is doing work, never as evidence against it. Behaviour recorded on two prompts ('Who are you?', 'Tell me about a city you like.'), both coherent and visibly off-baseline.",
+  "pushes": [
+    {
+      "layer": 14,
+      "n": 8949,
+      "dose": 0.45,
+      "mode": "add"
+    },
+    {
+      "layer": 13,
+      "n": 7956,
+      "dose": -0.45,
+      "mode": "add"
+    }
+  ],
+  "created": "2026-10-27T00:53:54",
+  "updated": "2026-10-27T00:55:19"
+}
