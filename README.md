@@ -3,7 +3,13 @@
 Steering-first neuron explorer for Qwen3.5-4B. Every MLP neuron in a layer is pushed up and down on a few prompts, every
 rollout is kept, and the explorer lays the results out over a 3D view of the model.
 
+Started as a fork of [lyramakesmusic/neuron-explorer](https://github.com/lyramakesmusic/neuron-explorer) (MIT), which is
+where the idea, the 3D map and the sweep harness come from. Everything below the upstream base is mine: the persons
+layer, the money lens, the advisor bridge, the live firing view, and the verification scripts. See
+[Provenance](#provenance) for what changed and why the history looks newer than the upstream repo.
+
 ![neuron explorer](explorer.png)
+
 
 ## Explorer
 
@@ -62,3 +68,54 @@ and {free} × {+3}, plus one unsteered baseline per prompt.
 | `sweep/capture_prefill.py` | `captures/<run>.mlp_in.npy`: MLP input at the last prompt token at the run's capture layers, steered |
 
 `research_log.md` holds the findings and reasoning; `NOTES.md` the source notes.
+
+## Checking it actually works
+
+Four scripts assert rather than print and hope. None of them need a GPU except
+`check_equivalence.py`, and none of them need a sweep to have just finished.
+
+    uv run python scripts/verify_runs.py ~/neuron-explorer     # is a pulled sweep complete, per layer?
+    uv run python scripts/verify_person.py                     # persons + per-token firing, against :8791
+    uv run python scripts/verify_money.py                      # money lens end to end, then the screen re-derived
+    uv run python sweep/check_equivalence.py --stats stats/q35-4b_L22.npz --neurons 2742,17,5000
+
+`verify_runs.py` exists because the pipeline's one real data-loss mode is a
+partial pull: the runs come back missing an output directory the meta named and
+nothing notices until the pods are gone. It checks completeness structurally,
+since `meta.json` does not record the neuron range or the control count.
+
+`verify_money.py` re-derives every screen criterion from the numbers the report
+already printed, so a row claiming 3/5 has to earn those three from its own
+figures.
+
+## Provenance
+
+This began as a fork of [lyramakesmusic/neuron-explorer](https://github.com/lyramakesmusic/neuron-explorer). Upstream
+supplies the concept, the 3D map view and the first version of the sweep harness; the persons layer, the money lens, the
+advisor bridge, live per-token firing and the verification scripts are additions on top.
+
+The fork's history was unusable as a portfolio piece: its two branches had separate roots (one of them a bulk tarball
+upload from a GPU pod) and one commit was a blanket "commit pending changes" sweep of the working tree. The work was
+re-landed here on a single linear history with messages that state what changed and why. Commit dates and authorship
+are from the original work; nothing was re-dated to look busier. If you want to compare against upstream, do it on
+content, not on commit count.
+
+## Status
+
+Working: the explorer, the sweep pipeline, persons, the money lens, the Claude agent bridge, and the four verification
+scripts. The caches under `explorer/cache/` (~53 MB of `.npz`) ship with the repo on purpose, so the map opens without
+re-running a sweep.
+
+Not done:
+
+- One model and one layer set are exercised (Qwen3.5-4B, layer 22 plus the depth sweep). Nothing else is tested.
+- No CI. The checks need a running server and a local model, so they are manual by design rather than faked green.
+- The sweep requires a CUDA 13 pod and a vLLM fork; there is no CPU path.
+- `reports/screen-2026-10-26.json` is one run against one market snapshot. The criteria are written down, the backtest
+  is not.
+- No packaging: no `pip install`, no entry point, no version pin for the model weights.
+
+## License
+
+MIT, inherited from upstream. See [LICENSE](LICENSE).
+
