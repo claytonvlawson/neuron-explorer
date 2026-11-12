@@ -97,8 +97,10 @@ advisor bridge, live per-token firing and the verification scripts are additions
 The fork's history was unusable as a portfolio piece: its two branches had separate roots (one of them a bulk tarball
 upload from a GPU pod) and one commit was a blanket "commit pending changes" sweep of the working tree. The work was
 re-landed here on a single linear history with messages that state what changed and why. Commit dates and authorship
-are from the original work; nothing was re-dated to look busier. If you want to compare against upstream, do it on
-content, not on commit count.
+are from the original work; nothing was re-dated to look busier. Two identities appear in the log that are not this
+GitHub handle: `Doctor Strange` is the git identity the GPU pod had configured, and `Lyra C` is the identity on the
+imported upstream snapshot. Both are my commits either way. If you want to compare against upstream, do it on content,
+not on commit count.
 
 ## Status
 
