@@ -1,0 +1,20 @@
+{
+ "neurons": 294912,
+ "layers": 32,
+ "per_emotion": {
+  "concern": 10085,
+  "confidence": 15605,
+  "tenderness": 29627,
+  "doubt": 17341,
+  "fear": 22111,
+  "urgency": 25293,
+  "joy": 23738,
+  "calm": 29672,
+  "anger": 50797,
+  "sadness": 18028,
+  "hope": 31145,
+  "curiosity": 21470
+ },
+ "ambiguous_share": 0.816,
+ "ambiguous_gap_below": 0.5
+}
