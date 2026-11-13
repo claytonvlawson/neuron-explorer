@@ -65,18 +65,24 @@ and {free} × {+3}, plus one unsteered baseline per prompt.
 | `explorer/build_layout.py` | `explorer/cache/layout_writes.npz` |
 | `explorer/build_connections.py` | `explorer/cache/connections.npz`: each neuron's 24 strongest direct-path links up and down |
 | `scripts/verify_person.py` | end-to-end check of persons + live firing against a running server |
+| `scripts/verify_reading.py` | offline check of the reading merge, plus the live stream against a running server |
+| `scripts/pull_taps.py` | pulls the public advisor's replayable exchanges from the Jetson into `explorer/cache/advisor_taps/` |
+| `scripts/verify_taps.py` | the tap writer and `/taps` reader, against the real server module with the model stubbed |
 | `sweep/capture_prefill.py` | `captures/<run>.mlp_in.npy`: MLP input at the last prompt token at the run's capture layers, steered |
 
 `research_log.md` holds the findings and reasoning; `NOTES.md` the source notes.
 
 ## Checking it actually works
 
-Four scripts assert rather than print and hope. None of them need a GPU except
+Five scripts assert rather than print and hope. None of them need a GPU except
 `check_equivalence.py`, and none of them need a sweep to have just finished.
 
     uv run python scripts/verify_runs.py ~/neuron-explorer     # is a pulled sweep complete, per layer?
     uv run python scripts/verify_person.py                     # persons + per-token firing, against :8791
     uv run python scripts/verify_money.py                      # money lens end to end, then the screen re-derived
+    uv run python scripts/verify_reading.py                    # the reading merge, then --live for the stream
+    uv run python scripts/pull_taps.py                         # public answers from the Jetson, for replay
+    uv run python scripts/verify_taps.py                       # the tap writer and reader, model stubbed
     uv run python sweep/check_equivalence.py --stats stats/q35-4b_L22.npz --neurons 2742,17,5000
 
 `verify_runs.py` exists because the pipeline's one real data-loss mode is a

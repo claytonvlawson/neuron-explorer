@@ -222,6 +222,10 @@ function markLeftFresh(t) { if (t !== leftTab) $(`#ltabs button[data-lt="${t}"]`
 // the map shows what the open tab shows: lens hits and the open neuron's web on net, what fired on run
 function syncLeftMap() {
   if (leftTab === "money") return;  // the money tab paints its own live firing; do not clear it on focus changes
+  if (leftTab === "advisor" && advLiveAnswer) {  // a live answer paints from its recorded readings, not the cube
+    if (advLast) advPaint(advLast); else map.setMarks([]);
+    return;
+  }
   if ((leftTab === "run" || leftTab === "advisor") && state.inf.text) { inferView(); showTokenPaths(state.inf.pos); return; }
   map.setMarks(leftTab === "net" && lensResults?.results ? lensResults.results : []);
   if (String(webKey).startsWith("tok/")) { webKey = null; refreshWeb(); }
@@ -279,6 +283,12 @@ async function showTokenPaths(pos) {
   map.setWeb(new Int16Array(await r.arrayBuffer()));
 }
 function previewToken(pos) {
+  if (pos == null) return;
+  if (advLiveAnswer) {  // a live answer has per-token readings, not a dense cube: paint from the recorded one
+    const ev = advNearest(pos);
+    if (ev) { advPaint(ev); advStage.textContent = `token ${pos}${ev.tok ? ` · "${ev.tok.trim()}"` : ""}`; }
+    return;
+  }
   const keep = state.inf.pos;
   state.inf.pos = pos; inferView(); state.inf.pos = keep;
   showTokenPaths(pos);
@@ -1163,21 +1173,133 @@ syncEdge(); updateInsets();
 // Qwen3.5-4B here, so every neuron it touched is visible. The stream arrives as SSE: retrieval, tokens, then
 // the scored activations, which land in the same state the "run" tab uses.
 const advStage = $("#adv-stage"), advSrc = $("#adv-src"), advAns = $("#adv-ans"), advToks = $("#adv-toks");
+const advDepth = $("#adv-depth"), advDepthBtn = $("#adv-depth-btn"), advAt = $("#adv-at");
+const advSlider = $("#adv-slider"), advFollowSeg = $("#adv-follow"), advDepthBox = $("#adv-depth-box");
+const advNote = $("#adv-note"), advTapSel = $("#adv-tap"), advTapBar = $("#adv-tap-bar"), advReadBtn = $("#adv-read");
 let advBusy = false;
+// A live ask records one sparse reading per generated token. There is no dense [layer, token, neuron] cube for
+// it, so the run tab's viewer must not be pointed at stale data: the panel paints from these instead.
+let advRun = null, advLiveAnswer = false, advMapAt = 0, advLast = null;
+const advReads = new Map();
+// The depth strip and the scrubber read the same cache: moving the position never runs the model again, and
+// nothing here asks /api/infer/view for a cube a live answer does not have.
+let advFollow = true, advMaxPos = -1, advSeekGen = 0, advDepthOpen = true;
 
-async function advisorAsk() {
-  const question = $("#adv-q").value.trim();
-  if (!question || advBusy) return;
-  advBusy = true; $("#adv-go").disabled = true;
+function advDepthStrip(ev) {
+  if (!advDepthOpen) return;
+  const lens = ev && ev.pos >= 0 ? (ev.lens || []) : [];
+  if (!lens.length) {
+    advDepth.innerHTML = ev && ev.pos >= 0 ? `<div class="none">no logit lens at this position</div>` : "";
+    return;
+  }
+  const last = String(lens[lens.length - 1][1] ?? "").trim() || "␣";  // the deepest layer; agreeing layers read brighter
+  advDepth.innerHTML = lens.map(([l, t]) => {
+    const s = String(t ?? "").trim() || "␣";
+    return `<div class="d${s === last ? " same" : ""}" title="L${l}: ${esc(s)}">` +
+      `<span class="l">L${l}</span><span class="t">${esc(s)}</span></div>`;
+  }).join("");
+}
+
+function advPaint(ev) {
+  advLast = ev;
+  map.setMarks((ev.read || []).map(r => ({ layer: r.layer, n: r.n, sign: r.s > 0 ? "+" : "-",
+    w: Math.min(1, 0.25 + Math.abs(r.s) / 4) })));
+  renderResults({ ready: true, fires: true, total: (ev.read || []).length, results: (ev.read || []).map(r => ({
+    layer: r.layer, n: r.n, sign: r.s > 0 ? "+" : "-", score: Math.abs(r.s), token: r.tok || ev.tok || "",
+    name: r.name, lens: r.w || [], swept: true })) }, $("#adv-rows"));
+  advDepthStrip(ev);
+  advAt.textContent = ev.pos >= 0 ? `pos ${ev.pos}${ev.tok ? ` · ${ev.tok.trim() || "␣"}` : ""}` : "whole answer";
+  if (ev.pos >= 0) advSlider.value = String(ev.pos);
+  // the chip for the position being read is the pin, wherever the move came from (slider, arrows, hover, click)
+  const chips = advToks.querySelectorAll("button");
+  if (chips.length) chips.forEach(x => x.classList.toggle("on", +x.dataset.i === ev.pos));
+}
+function advPaintAll() {  // the "all" button for a live answer: strongest firing across every captured token
+  const all = [...advReads.values()].flatMap(ev => (ev.read || []).map(r => ({ ...r, tok: ev.tok, pos: ev.pos })));
+  all.sort((a, b) => Math.abs(b.s) - Math.abs(a.s));
+  if (!all.length) { map.setMarks([]); $("#adv-rows").innerHTML = ""; return; }
+  advPaint({ pos: -1, read: all.slice(0, 12) });
+}
+function advNearest(pos) {
+  for (let d = 0; d < 4; d++) {
+    if (advReads.has(pos - d)) return advReads.get(pos - d);
+    if (advReads.has(pos + d)) return advReads.get(pos + d);
+  }
+  return null;
+}
+
+function advSyncFollow() {
+  advFollowSeg.querySelectorAll("button").forEach(b => b.classList.toggle("on", (b.dataset.f === "follow") === advFollow));
+  advSlider.disabled = advMaxPos < 0;
+}
+
+async function advSeek(pos) {  // paint a recorded position; fetch it only when this tab never saw it
+  if (advMaxPos < 0) return;
+  pos = Math.max(0, Math.min(advMaxPos, pos));
+  const mine = ++advSeekGen;
+  const ev = advReads.get(pos) || advNearest(pos);
+  if (ev) { advPaint(ev); return; }
+  if (!advRun) return;
+  try {
+    const r = await api(`/api/advisor/reading?run=${advRun}&i=${pos}`);
+    if (mine !== advSeekGen || !r.reading) return;  // a newer move won
+    advReads.set(r.reading.pos, r.reading);
+    advPaint(r.reading);
+  } catch (e) { /* the strip keeps the last position it had */ }
+}
+
+function advHold(pos) {  // a click, a slider drag or an arrow key pins the position instead of following the answer
+  clearTimeout(tokTimer); tokHover = null;  // a deliberate move beats a hover preview that has not fired yet
+  advFollow = false;
+  advSyncFollow();
+  advSeek(pos);
+}
+
+advFollowSeg.addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  clearTimeout(tokTimer); tokHover = null;
+  advFollow = b.dataset.f === "follow";
+  advSyncFollow();
+  if (advFollow) advSeek(advMaxPos);
+});
+advSlider.addEventListener("input", () => advHold(+advSlider.value));
+// arrows scrub one generated token at a time, but never out of a box the user is typing in (the slider keeps
+// its own native arrow handling, which fires the same input event)
+document.addEventListener("keydown", e => {
+  if ((e.key !== "ArrowLeft" && e.key !== "ArrowRight") || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+  if (leftTab !== "advisor" || advMaxPos < 0) return;
+  const t = e.target;
+  if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) return;
+  e.preventDefault();
+  advHold((+advSlider.value || 0) + (e.key === "ArrowRight" ? 1 : -1));
+});
+advDepthBtn.onclick = () => {
+  advDepthOpen = !advDepthOpen;
+  advDepthBtn.textContent = advDepthOpen ? "▾ depth" : "▸ depth";
+  advDepthBtn.setAttribute("aria-expanded", String(advDepthOpen));
+  advDepth.hidden = !advDepthOpen;
+};
+
+function advReset() {
   advStage.textContent = "retrieving…";
   advSrc.innerHTML = ""; advAns.textContent = ""; advToks.innerHTML = ""; $("#adv-rows").innerHTML = "";
+  advRun = null; advLiveAnswer = false; advReads.clear(); advMapAt = 0;
+  advFollow = true; advMaxPos = -1; advSeekGen++;
+  advSlider.max = "0"; advSlider.value = "0"; advAt.textContent = ""; advDepth.innerHTML = "";
+  advDepthBox.hidden = true;
+  advSyncFollow();
+  advNote.hidden = true; advNote.textContent = "";
   state.inf = { text: null, pos: -1, sign: "both" };
-  const t0 = performance.now();
+}
 
+// One SSE loop for both sources: an ask the local model answers, and a replay of an answer another model wrote.
+// The events are the same shape on purpose, so the map, the depth strip, the scrubber and hover do not branch.
+async function advStream(url, payload) {
+  const t0 = performance.now();
   try {
-    const r = await fetch("/api/advisor/ask", {
+    const r = await fetch(url, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, max_new: 300 }),
+      body: JSON.stringify(payload),
     });
     if (!r.ok || !r.body) {
       const e = await r.json().catch(() => ({}));
@@ -1196,11 +1318,37 @@ async function advisorAsk() {
         if (!raw.startsWith("data: ")) continue;
         const ev = JSON.parse(raw.slice(6));
         if (ev.stage === "retrieval") {
-          advStage.textContent = `retrieved ${ev.sources.length} notes in ${ev.ms} ms`;
+          advRun = ev.run; advLiveAnswer = !!ev.live || !!ev.replay; advReads.clear(); advMapAt = 0;
+          advDepthBox.hidden = !advLiveAnswer;  // the dense cube path has no per-token lens to strip
+          if (ev.replay) {
+            advNote.hidden = false;
+            advNote.textContent = `written by ${ev.model || "another model"}${ev.served_by ? ` (${ev.served_by})` : ""}; ` +
+              `read by Qwen3.5-4B from the recorded prompt. A replay of text, not a recording of that model.`;
+            advStage.textContent = `replay · ${ev.sources.length} recorded sources`;
+          } else {
+            advStage.textContent = `retrieved ${ev.sources.length} notes in ${ev.ms} ms`;
+          }
           advSrc.innerHTML = ev.sources.map((s, k) =>
             `<div class="s${ev.crisis && k === 0 ? " crisis" : ""}" title="${esc(ev.titles?.[k] || s)}">${esc(s)}</div>`).join("");
         } else if (ev.stage === "prompt") {
-          advStage.textContent = `prompt ${ev.prompt_tokens} tokens, generating…`;
+          advStage.textContent = ev.replay
+            ? `${ev.prompt_tokens} recorded prompt tokens, forcing the answer…`
+            : `prompt ${ev.prompt_tokens} tokens, generating…`;
+        } else if (ev.stage === "read") {
+          advReads.set(ev.pos, ev);
+          advMaxPos = Math.max(advMaxPos, ev.pos);
+          advSlider.max = String(advMaxPos);
+          advSlider.disabled = false;
+          const word = ev.replay ? "replay" : "live";
+          // the count keeps moving even while held; only the painting follows the toggle
+          advStage.textContent = advFollow
+            ? `${word} · ${ev.pos + 1} token${ev.pos ? "s" : ""} · ${ev.read.length} firing`
+            : `${word} · ${ev.pos + 1} token${ev.pos ? "s" : ""} · held at ${advSlider.value}`;
+          const now = performance.now();
+          if (advFollow && now - advMapAt > 120) {  // text first: the map and the list can lag a few tokens
+            advMapAt = now;
+            advPaint(ev);
+          }
         } else if (ev.stage === "token") {
           answer += ev.t;
           advAns.innerHTML = md(answer);  // the bot answers in markdown; the widget renders it, so does this
@@ -1209,17 +1357,32 @@ async function advisorAsk() {
           advStage.textContent = `${ev.gen_tokens} tokens generated, scoring activations…`;
         } else if (ev.stage === "done") {
           const secs = ((performance.now() - t0) / 1000).toFixed(1);
-          advStage.textContent = `${ev.prompt_tokens} prompt tok → ${ev.gen_tokens} out · ${secs}s · ${ev.scored} positions scored`;
+          const sparse = !!ev.live || !!ev.replay;  // a per-token reading, not the dense cube
+          advStage.textContent = ev.replay
+            ? `${ev.prompt_tokens} recorded prompt tok → ${ev.gen_tokens} forced · ${secs}s · replay reading, ${ev.scored} positions`
+            : ev.live
+              ? `${ev.prompt_tokens} prompt tok → ${ev.gen_tokens} out · ${secs}s · live reading, ${ev.scored} positions`
+              : `${ev.prompt_tokens} prompt tok → ${ev.gen_tokens} out · ${secs}s · ${ev.scored} positions scored`;
           const lastPos = ev.pos[ev.pos.length - 1] ?? -1;  // pin the last answer token so the panel is not empty
-          state.inf = { text: answer, pos: lastPos, sign: "both", tokens: ev.tokens, answerFrom: ev.answer_from };
+          state.inf = { text: answer, pos: sparse ? -1 : lastPos, sign: "both", tokens: ev.tokens,
+                        answerFrom: sparse ? 0 : ev.answer_from };
+          if (sparse && lastPos >= 0) {  // the last reading can land inside the paint throttle; show it now
+            advMaxPos = Math.max(advMaxPos, lastPos);
+            advSlider.max = String(advMaxPos);
+            advSyncFollow();
+            if (advFollow) advSeek(lastPos);
+          }
           advToks.innerHTML = ev.tokens.map((t, k) => {
-            const cls = [ev.pos[k] < ev.answer_from ? "ctx" : "", ev.pos[k] === lastPos ? "on" : ""].filter(Boolean).join(" ");
+            const cls = [ev.pos[k] < (sparse ? 0 : ev.answer_from) ? "ctx" : "", ev.pos[k] === lastPos ? "on" : ""].filter(Boolean).join(" ");
             return `<button data-i="${ev.pos[k]}" class="${cls}">${esc(t)}</button>`;
           }).join("");
           if (ev.crisis) advSrc.insertAdjacentHTML("afterbegin",
-            `<div class="s crisis">crisis path fired: guardrails note force-injected</div>`);
-          await inferView(qGen);
-          showTokenPaths(lastPos);
+            `<div class="s crisis">${ev.replay ? "this answer took the crisis path: the guardrails note was force-injected"
+              : "crisis path fired: guardrails note force-injected"}</div>`);
+          if (!sparse) {  // a sparse reading keeps itself; the dense cube only exists on the old path
+            await inferView(qGen);
+            showTokenPaths(lastPos);
+          }
           markLeftFresh("advisor");
         } else if (ev.stage === "error") {
           advStage.textContent = ev.error;
@@ -1228,16 +1391,62 @@ async function advisorAsk() {
     }
   } catch (e) {
     advStage.textContent = `error: ${e.message}`;
+  }
+}
+
+async function advisorAsk() {
+  const question = $("#adv-q").value.trim();
+  if (!question || advBusy) return;
+  advBusy = true; $("#adv-go").disabled = true;
+  advReset();
+  try {
+    await advStream("/api/advisor/ask", { question, max_new: 300 });
   } finally {
     advBusy = false; $("#adv-go").disabled = false;
   }
 }
 
+// A reading of public text: teacher-force the tap's own prompt and answer through Qwen3.5-4B. Nothing is
+// sampled, so the map shows the state that produced each word the visitor read, on the writer's prompt.
+async function advisorReplay() {
+  const id = advTapSel.value;
+  if (!id || advBusy) return;
+  advBusy = true; $("#adv-go").disabled = true; advReadBtn.disabled = true;
+  advReset();
+  advStage.textContent = "reading the tap…";
+  try {
+    await advStream("/api/advisor/replay", { id });
+  } finally {
+    advBusy = false; $("#adv-go").disabled = false; advReadBtn.disabled = false;
+  }
+}
+
+async function advTapsLoad() {
+  try {
+    const r = await api("/api/advisor/taps");
+    const taps = r.taps || [];
+    if (!taps.length) { advTapBar.hidden = true; return; }
+    advTapBar.hidden = false;
+    advTapSel.innerHTML = taps.map(t => {
+      const when = t.ts ? new Date(t.ts * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
+      const q = (t.question || "(question not recorded)").replace(/\s+/g, " ").slice(0, 64);
+      return `<option value="${t.id}">${esc(when ? `${when} · ${q}` : q)}</option>`;
+    }).join("");
+  } catch (e) { advTapBar.hidden = true; }  // the panel still asks; the menu is an extra
+}
+
 $("#adv-go").onclick = advisorAsk;
+$("#adv-read").onclick = advisorReplay;
 $("#adv-all").onclick = () => {
   if (!state.inf.text) return;
   state.inf.pos = -1;
   advToks.querySelectorAll("button").forEach(x => x.classList.remove("on"));
+  if (advLiveAnswer) {  // the dense "strongest across the answer" view needs the cube; a live answer has readings
+    advFollow = false; advSyncFollow();
+    advPaintAll();
+    advStage.textContent = `all ${advReads.size} tokens · strongest firing`;
+    return;
+  }
   inferView(); showTokenPaths(-1);
 };
 $("#adv-q").addEventListener("keydown", e => {
@@ -1250,12 +1459,24 @@ advToks.addEventListener("pointerover", e => {
   tokTimer = setTimeout(() => previewToken(tokHover), 90);
 });
 advToks.addEventListener("pointerleave", () => {
-  clearTimeout(tokTimer); tokHover = null; inferView(); showTokenPaths(state.inf.pos);
+  clearTimeout(tokTimer); tokHover = null;
+  if (advLiveAnswer) {  // a hover preview is not a pin: go back to the followed or pinned position
+    if (advFollow) advSeek(advMaxPos);
+    else if (state.inf.pos >= 0) advSeek(state.inf.pos);
+    return;
+  }
+  inferView(); showTokenPaths(state.inf.pos);
 });
 advToks.addEventListener("click", e => {
   const b = e.target.closest("button"); if (!b) return;
+  clearTimeout(tokTimer); tokHover = null;
   state.inf.pos = state.inf.pos === +b.dataset.i ? -1 : +b.dataset.i;
   advToks.querySelectorAll("button").forEach(x => x.classList.toggle("on", +x.dataset.i === state.inf.pos));
+  if (advLiveAnswer) {
+    if (state.inf.pos < 0) { advFollow = true; advSyncFollow(); advSeek(advMaxPos); }  // unpinning resumes follow
+    else advHold(state.inf.pos);  // pinning holds this position, even while the answer keeps streaming
+    return;
+  }
   inferView(); showTokenPaths(state.inf.pos);
 });
 (async () => {
@@ -1263,6 +1484,7 @@ advToks.addEventListener("click", e => {
     const st = await api("/api/advisor/status");
     advStage.textContent = st.ready ? `${st.chunks} chunks · ${st.top_k} per question` : (st.error || "index not ready");
   } catch (e) { /* the panel still works; the ask will report the real error */ }
+  advTapsLoad();  // the public-answer menu; empty or missing is not an error
 })();
 
 // ---------- money lens: read a real document sentence by sentence against the Money person ----------

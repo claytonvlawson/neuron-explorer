@@ -329,12 +329,43 @@ tr.con .logit .tok { font-size: 10.5px; }
 #adv-bar { display: flex; align-items: center; gap: 8px; padding: 0 10px 6px; }
 #adv-go { font: 11px var(--mono); background: var(--raise); color: var(--ink); border-radius: 3px; padding: 3px 10px; }
 #adv-go[disabled] { color: var(--faint); }
-#adv-out { overflow-y: auto; max-height: 34vh; padding: 0 10px; }
+#adv-all { font: 11px var(--mono); white-space: nowrap; }
+#adv-stage { flex: 1; min-width: 0; font-size: 11px; }
+#adv-tap-bar { display: flex; align-items: center; gap: 6px; padding: 0 10px 6px; }
+#adv-tap {
+  flex: 1; min-width: 0; font: 11px var(--mono); color: var(--dim);
+  background: var(--raise); border: 1px solid var(--line); border-radius: 3px; padding: 3px 4px;
+}
+#adv-read { font: 11px var(--mono); white-space: nowrap; }
+#adv-read[disabled] { color: var(--faint); }
+#adv-note {
+  font-size: 11px; line-height: 1.45; color: var(--dim);
+  border-left: 2px solid #8a7bd8; padding: 4px 0 4px 7px; margin: 0 0 7px;
+}
+#adv-out { overflow-y: auto; max-height: 26vh; padding: 0 10px; }
 #adv-src { font: 11px var(--mono); color: var(--dim); }
 #adv-src .s { padding: 1px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #adv-src .s.crisis { color: #e0a06c; }
 #adv-ans { font: 13px/1.5 var(--font); color: var(--ink); margin: 6px 0 8px; white-space: pre-wrap; }
 #adv-ans:empty { display: none; }
+/* the live reading's depth strip: one line per layer, the token the logit lens would have said next. Three
+   columns keep all 32 layers on screen on a laptop; deeper layers are lower and to the right. */
+#adv-depth-box { padding: 2px 10px 4px; border-top: 1px solid var(--line); }
+#adv-depth-box[hidden] { display: none; }
+#adv-depth-head { display: flex; align-items: baseline; gap: 8px; padding: 4px 0 2px; }
+#adv-depth-head button { font: 10.5px var(--mono); color: var(--faint); white-space: nowrap; }
+#adv-depth-head button:hover { color: var(--ink); }
+#adv-at { margin-left: auto; font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#adv-depth { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); column-gap: 8px; font: 10.5px/13px var(--mono); }
+#adv-depth[hidden] { display: none; }
+#adv-depth .d { display: flex; align-items: baseline; gap: 4px; min-width: 0; }
+#adv-depth .d .l { flex: none; width: 3.1em; text-align: right; color: var(--faint); }
+#adv-depth .d .t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; color: var(--dim); }
+#adv-depth .d.same .t { color: var(--ink); }
+#adv-depth .none { color: var(--faint); font: 10.5px/1.4 var(--mono); }
+#adv-scrub { display: flex; align-items: center; gap: 8px; padding: 3px 0 2px; }
+#adv-slider { flex: 1; min-width: 0; height: 14px; padding: 0; background: none; accent-color: var(--link); }
+#adv-slider:disabled { opacity: 0.35; }
 #adv-toks { display: flex; flex-wrap: wrap; gap: 3px; padding: 0 10px 8px; max-height: 96px; overflow-y: auto; }
 #adv-toks button { font: 12px var(--mono); background: var(--raise); border-radius: 3px; padding: 1px 4px; white-space: pre; color: var(--dim); }
 #adv-toks button.on { background: rgba(56, 200, 255, 0.22); color: var(--ink); }

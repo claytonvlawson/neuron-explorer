@@ -8,6 +8,7 @@ unit as the sweep's `--dose-unit rel`.
 import json
 import os
 import sqlite3
+import sys
 import threading
 
 import numpy as np
@@ -15,6 +16,7 @@ import torch
 from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
 
 MODEL = os.environ.get("EXPLORER_MODEL", "Qwen/Qwen3.5-4B")
+STARTUP_MODEL = MODEL  # the model every calibration file in CACHE was measured on; anything else runs uncalibrated
 NO_MODEL = bool(os.environ.get("EXPLORER_NO_MODEL"))  # cache-only: never download or load weights
 REFERENCE_TEXT = (
     "The history of the region is long and varied. Farmers settled the river valley first, then traders arrived, "
@@ -25,6 +27,25 @@ REFERENCE_TEXT = (
 
 
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+
+# Live reading: what fires while the model answers, captured from the decode pass that is already running.
+# READ_K is the global shortlist per token, READ_PER_LAYER how many each layer contributes to it, READ_LENS the
+# per-layer logit lens (one batched matmul; set 0 on a slow box), READ_LAYERS a comma list to read only some layers.
+READ_K = int(os.environ.get("EXPLORER_READ_K", "12"))
+READ_PER_LAYER = int(os.environ.get("EXPLORER_READ_PER_LAYER", "4"))
+READ_LENS = os.environ.get("EXPLORER_READ_LENS", "1") not in ("0", "false", "False", "no", "off", "")
+READ_LAYERS = [int(x) for x in os.environ.get("EXPLORER_READ_LAYERS", "").split(",") if x.strip()]
+
+
+def merge_reads(per_layer, k=READ_K):
+    """The k strongest firings across layers, by |score|, from each layer's shortlist.
+
+    per_layer: {layer: [(neuron, score, activation), ...]} -> [{"layer", "n", "s", "a"}, ...].
+    Pure so it can be checked without a model.
+    """
+    flat = sorted(((abs(s), layer, n, s, a) for layer, rows in per_layer.items() for n, s, a in rows),
+                  reverse=True)
+    return [{"layer": layer, "n": n, "s": round(s, 2), "a": round(a, 2)} for _, layer, n, s, a in flat[:k]]
 
 
 class Runtime:
@@ -38,6 +59,8 @@ class Runtime:
         self._con_idx = None
         self.lock = threading.Lock()
         self.model = self.tok = None
+        self.model_id = MODEL
+        self.calibrated = True
         self.status = "idle"
         self.resid_p50 = {}
         self._push = None  # [(layer, neuron, mode, per-row values tensor)], any number of neurons at once (neuron None = all)
@@ -45,6 +68,8 @@ class Runtime:
         self._read = None  # (layer, neuron) while reading
         self._seen = {}
         self._fire = None  # {"rows", "k", "out", "last"}: per-token top activations while steering (the live firing view)
+        self.mood = None  # the emotion probe (mood.load): {"layer", "dirs", "mu", "sd", "mean_neu", "names"}
+        self._reading = None  # {"layers", "per_layer", "k", "lens", "out", "resid"}: the live reading of one answer
         self._fire_scale = None  # act_scale.npz as device tensors: the calibration the 'fires' view scores against
         self._con_cache = {}
         self._capture_all = None
@@ -64,8 +89,12 @@ class Runtime:
                 return
             self.status = "loading"
             dev = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
-            self.tok = AutoTokenizer.from_pretrained(MODEL)
-            m = Qwen3_5ForConditionalGeneration.from_pretrained(MODEL, dtype=torch.bfloat16).to(dev).eval()
+            try:
+                self.tok = AutoTokenizer.from_pretrained(self.model_id)
+                m = Qwen3_5ForConditionalGeneration.from_pretrained(self.model_id, dtype=torch.bfloat16).to(dev).eval()
+            except Exception as e:
+                self.status = f"error: {e}"
+                raise
             self.dev, self.model, self.lm = dev, m, m.model.language_model
             for i, layer in enumerate(self.lm.layers):
                 layer.mlp.down_proj.register_forward_pre_hook(self._hook(i))
@@ -79,6 +108,29 @@ class Runtime:
                     a = layer.linear_attn
                     a.out_proj.register_forward_pre_hook(self._head_hook(i, a.num_v_heads))
             self.status = "ready"
+
+    def switch_model(self, model_id):
+        """Hot-swap the live model. Per-model assets (act_scale, the mood probe, neuron word lenses) were measured
+        on STARTUP_MODEL, so any other model runs uncalibrated: raw activation scores, no mood, no neuron words."""
+        if NO_MODEL:
+            raise RuntimeError("live model disabled (EXPLORER_NO_MODEL)")
+        if model_id == self.model_id and self.model is not None:
+            return
+        self.status = "loading"
+        self.model_id = model_id
+        self.calibrated = model_id == STARTUP_MODEL
+        old, self.model, self.tok, self.lm = self.model, None, None, None
+        self.mood = None
+        self._fire_scale = self._lens_idx = self._con_idx = None
+        self._seen, self.resid_p50, self._lens_cache, self._con_cache = {}, {}, {}, {}
+        del old
+        import gc
+        gc.collect()
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self.ensure_loaded()
 
     def _hook(self, i):
         def hook(mod, inp):
@@ -100,6 +152,9 @@ class Runtime:
             if self._fire is not None:
                 # before this layer's push: the dose you add is an instrument setting, not something the model did
                 self._record_fire(i, h, self._fire)
+            if self._reading is not None:
+                # same rule as firing: read the layer as the model computed it, before any push lands on it
+                self._record_read(i, h)
             if mine:
                 h = h.clone()
                 for _, n, mode, vals in mine:
@@ -115,6 +170,8 @@ class Runtime:
     def fire_scale(self):
         """act_scale.npz on the model's device, resolved the way /api/infer scores: each side floored at a tenth of
         the other, so a neuron that never goes negative is not divided by ~0."""
+        if not self.calibrated:  # act_scale.npz was measured on STARTUP_MODEL; dividing by it would be fiction
+            return None
         if self._fire_scale is None:
             path = os.path.join(CACHE, "act_scale.npz")
             if not os.path.exists(path):
@@ -151,6 +208,83 @@ class Runtime:
             out.append((r, [(int(n), round(float(s[n]), 3), round(float(act[n]), 2)) for n in idx]))
         fr["out"].append((layer, out))
 
+    # ---------- the live reading ----------
+    def _record_read(self, layer, h):
+        """Shortlist this layer's strongest neurons at the token that predicts the next one, before this layer's
+        push (same reason as _record_fire). Scores use act_scale, the calibration the 'fires' view uses, so 1.0
+        means "as strong as this neuron's usual extreme"."""
+        rd = self._reading
+        if rd is None or layer not in rd["layers"]:
+            return
+        sc = self.fire_scale()
+        act = h[0, -1].float()
+        if sc is not None:
+            pos, neg = sc[0][layer].to(act.device), sc[1][layer].to(act.device)
+            s = torch.where(act >= 0, act / pos, -(act / neg))
+        else:
+            s = act
+        k = min(rd["per_layer"], s.numel())
+        idx = s.abs().topk(k).indices.tolist()
+        rd["out"][layer] = [(int(n), float(s[n]), float(act[n])) for n in idx]
+
+    def _read_words(self, layer, n, s):
+        """The steer lens (or logit lens) words a firing neuron is about, so a reading says 'money, cost' and
+        not 'L22 N8412'."""
+        try:
+            if not self.calibrated:  # the lens indexes were built from STARTUP_MODEL's vocab and neurons
+                return []
+            idx = self.steer_index() or self.lens_index()
+            if idx is None:
+                return []
+            v = self.vocab_strings()
+            return [v[t] for t in idx["up" if s > 0 else "down"][layer, n, :4]]
+        except Exception:
+            return []
+
+    def _logit_lens(self, resid):
+        """Top-1 next token at every layer, one batched matmul over the captured residuals: how the answer
+        sharpens with depth. Skipped when there is no model (the merge and the firing list still work)."""
+        if self.model is None or not resid:
+            return []
+        try:
+            layers = sorted(resid)
+            with torch.inference_mode():
+                rows = torch.stack([resid[l] for l in layers]).to(self.model.dtype)
+                top = self.model.lm_head(self.lm.norm(rows)).float().argmax(-1).tolist()
+            v = self.vocab_strings()
+            return [[l, v[t]] for l, t in zip(layers, top)]
+        except Exception:
+            return []
+
+    def _flush_read(self, pos, tok=None):
+        """One reading for the token at generated index `pos`: the strongest firings across layers, the token
+        they produced, and (with residuals) one logit-lens token per layer. Clears the per-pass buffers."""
+        rd = self._reading
+        if rd is None:
+            return None
+        rows = merge_reads(rd["out"], rd["k"])
+        for r in rows:
+            r["w"] = self._read_words(r["layer"], r["n"], r["s"])
+        ev = {"pos": int(pos), "read": rows}
+        if tok is not None:
+            try:
+                ev["tok"] = self.vocab_strings()[int(tok)]
+            except Exception:
+                pass
+        if rd["lens"]:
+            lens = self._logit_lens({l: v for l, v in rd["resid"].items() if l in rd["layers"]})
+            if lens:
+                ev["lens"] = lens
+        if self.mood is not None and self.mood["layer"] in rd["resid"]:
+            try:
+                import mood as _mood
+                ev["mood"] = [round(float(x), 2) for x in _mood.score_vec(self, rd["resid"][self.mood["layer"]]).tolist()]
+            except Exception as e:  # the mood is an extra; it must not cost the reading
+                print(f"mood disabled: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                self.mood = None
+        rd["out"], rd["resid"] = {}, {}
+        return ev
+
     def _head_hook(self, i, n_heads):
         def hook(mod, inp):
             mine = [x for x in self._heads if x[0] == i] if self._heads else []
@@ -172,9 +306,14 @@ class Runtime:
 
     def _resid_hook(self, i):
         def hook(mod, inp, out):
+            h = out[0] if isinstance(out, tuple) else out
             if self._seen.get("want_resid") == i:
-                h = out[0] if isinstance(out, tuple) else out
                 self._seen["resid"] = h[0, 1:].float().norm(dim=-1).cpu()
+            rd = self._reading
+            if rd is not None and ((rd["lens"] and i in rd["layers"]) or (self.mood is not None and i == self.mood["layer"])):
+                # the residual leaving this layer at the token that predicts the next one: the logit-lens input
+                # (and, at the probe's layer, the mood input)
+                rd["resid"][i] = h[0, -1].float()
         return hook
 
     def layer_resid_p50(self, layer):
@@ -319,18 +458,29 @@ class Runtime:
                 out.append(row)
             return out
 
-    def generate_messages(self, messages, max_new=320, cancel=None):
+    def generate_messages(self, messages, max_new=320, cancel=None, read=None, pushes=None):
         """Greedy-decode one chat conversation with no steering. Yields (text_delta, token_id), then (None, None).
 
         The advisor bridge uses this to run the Parent Advisor prompt on the local model; the token ids it
         yields are what the caller concatenates onto the prompt ids to score activations afterwards.
+
+        With `read`, a callable invoked once per emitted token, before its text delta, with that token's live
+        reading: {"pos", "tok", "read": [{layer, n, s, a, w}], "lens": [[layer, token], ...]}. It comes out of
+        the decode pass already running, so a live reading costs no extra forward pass.
         """
         self.ensure_loaded()
         with self.lock:
             if cancel is not None and cancel.is_set():
                 yield None, None
                 return
+            layers = set(READ_LAYERS) if READ_LAYERS else set(range(len(self.lm.layers)))
+            self._reading = ({"layers": layers, "per_layer": READ_PER_LAYER, "k": READ_K, "lens": READ_LENS,
+                              "out": {}, "resid": {}} if read is not None else None)
             try:
+                # pushes = [(layer, neuron, dose, "add")]: the user's tweaks, applied to every position of this one
+                # row (prompt and answer). Built before self._push is set, since sizing a dose may run a forward.
+                entries = [self._push_entry(l, n, d, m, (1,)) for l, n, d, m in (pushes or [])]
+                self._push = entries or None
                 seq = self.messages_ids(messages)
                 ids = torch.tensor([seq], device=self.dev)
                 eos = self.tok.convert_tokens_to_ids("<|im_end|>")
@@ -344,6 +494,14 @@ class Runtime:
                         t = int(nxt[0])
                         if t == eos:
                             break
+                        if read is not None:
+                            ev = self._flush_read(len(out_ids), t)
+                            if ev:
+                                try:
+                                    read(ev)
+                                except Exception as e:  # a broken reader must not cost the answer
+                                    print(f"reading disabled: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                                    read, self._reading = None, None
                         out_ids.append(t)
                         text = self.tok.decode(out_ids, skip_special_tokens=True)
                         if not text.endswith("\ufffd"):  # hold back a partial multi-byte character
@@ -352,7 +510,58 @@ class Runtime:
                         out = self.model(input_ids=nxt[:, None], past_key_values=out.past_key_values,
                                          use_cache=True, logits_to_keep=1)
             finally:
-                pass
+                self._reading = None
+                self._push = None
+        yield None, None
+
+    def replay_messages(self, messages, answer, cancel=None, read=None):
+        """Teacher-force a recorded answer through the model, yielding (text_delta, token_id) per token.
+
+        Nothing is sampled and EOS does not stop it: the point is to read the text that was actually written,
+        including words this model would not have chosen. The reading for token i is captured after the prompt
+        plus tokens 0..i-1, the same state `generate_messages` reads before emitting token i, so a replay and a
+        live reading are the same measurement of different text.
+
+        With `read`, the callback gets {"pos", "tok", "read": [...], "lens": [...], "forced": True} before each
+        token's delta. A replay costs one forward pass per answer token, the same decode cost as live, after a
+        prefill of the whole recorded prompt.
+        """
+        self.ensure_loaded()
+        with self.lock:
+            if cancel is not None and cancel.is_set():
+                yield None, None
+                return
+            layers = set(READ_LAYERS) if READ_LAYERS else set(range(len(self.lm.layers)))
+            self._reading = ({"layers": layers, "per_layer": READ_PER_LAYER, "k": READ_K, "lens": READ_LENS,
+                              "out": {}, "resid": {}} if read is not None else None)
+            try:
+                seq = self.messages_ids(messages)
+                ans = list(self.tok(answer, add_special_tokens=False).input_ids)
+                done, sent = [], ""
+                with torch.inference_mode():
+                    out = self.model(input_ids=torch.tensor([seq], device=self.dev),
+                                     use_cache=True, logits_to_keep=1)
+                    for i, t in enumerate(ans):
+                        if cancel is not None and cancel.is_set():
+                            break
+                        if read is not None:
+                            ev = self._flush_read(i, t)
+                            if ev:
+                                ev["forced"] = True
+                                try:
+                                    read(ev)
+                                except Exception as e:  # a broken reader must not cost the replay
+                                    print(f"reading disabled: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                                    read, self._reading = None, None
+                        done.append(t)
+                        text = self.tok.decode(done, skip_special_tokens=True)
+                        if not text.endswith("\ufffd"):  # hold back a partial multi-byte character
+                            yield text[len(sent):], t
+                            sent = text
+                        out = self.model(input_ids=torch.tensor([[t]], device=self.dev),
+                                         past_key_values=out.past_key_values, use_cache=True, logits_to_keep=1)
+            finally:
+                self._reading = None
         yield None, None
 
     def token_units(self, ids):

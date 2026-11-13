@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import threading
+import uuid
 from datetime import datetime
 
 import numpy as np
@@ -23,7 +24,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "sweep"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rank import compute_units  # noqa: E402
-from runtime import NO_MODEL, Runtime  # noqa: E402
+from runtime import NO_MODEL, STARTUP_MODEL, Runtime  # noqa: E402
 
 RUNS, STATS = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
 NAMES = os.path.join(ROOT, "explorer", "names.json")
@@ -33,6 +34,13 @@ ARCH = {"n_layers": _cfg.num_hidden_layers, "hidden": _cfg.hidden_size, "inter":
         "layer_types": list(_cfg.layer_types), "attn_heads": _cfg.num_attention_heads,
         "kv_heads": _cfg.num_key_value_heads, "linear_k_heads": _cfg.linear_num_key_heads,
         "linear_v_heads": _cfg.linear_num_value_heads}
+LIVE_ARCH = dict(ARCH)  # the model actually in memory; ARCH describes the startup model's sweep data
+
+
+def live_arch(mid):
+    c = AutoConfig.from_pretrained(mid)
+    tc = c.get_text_config() if hasattr(c, "get_text_config") else c
+    return {"n_layers": tc.num_hidden_layers, "hidden": tc.hidden_size, "inter": tc.intermediate_size}
 
 app = FastAPI()
 
@@ -1207,7 +1215,88 @@ async def agent_chat(req: Request):
 
 @app.get("/api/status")
 def status():
-    return {"status": rt.status}
+    return {"status": rt.status, "model": rt.model_id, "calibrated": rt.calibrated, "layers": LIVE_ARCH["n_layers"]}
+
+
+# ---------- model switching ----------
+HF_CACHE = os.path.expanduser("~/.cache/huggingface/hub")
+
+
+def hf_cache_models():
+    """Models in the local Hugging Face cache with their architecture, so the dropdown can say upfront which
+    ones this instrument can actually hook (Qwen3.5 family) and which it cannot."""
+    out = []
+    if not os.path.isdir(HF_CACHE):
+        return out
+    for d in sorted(os.listdir(HF_CACHE)):
+        if not d.startswith("models--"):
+            continue
+        mid = d[len("models--"):].replace("--", "/")
+        cfg = {}
+        snap_root = os.path.join(HF_CACHE, d, "snapshots")
+        if os.path.isdir(snap_root):
+            for s in sorted(os.listdir(snap_root), reverse=True):
+                p = os.path.join(snap_root, s, "config.json")
+                if os.path.exists(p):
+                    try:
+                        cfg = json.load(open(p))
+                    except Exception:
+                        cfg = {}
+                    break
+        archs = (cfg.get("text_config") or cfg).get("architectures") or cfg.get("architectures") or []
+        out.append({"id": mid, "arch": archs[0] if archs else "", "compatible": any("Qwen3_5" in a for a in archs)})
+    return out
+
+
+@app.get("/api/models")
+def models_list():
+    ids = {m["id"]: m for m in hf_cache_models()}
+    if rt.model_id not in ids:
+        ids[rt.model_id] = {"id": rt.model_id, "arch": "", "compatible": True}
+    out = []
+    for m in sorted(ids.values(), key=lambda x: (not x["compatible"], x["id"])):
+        m = dict(m)
+        m["current"] = m["id"] == rt.model_id
+        m["calibrated"] = m["id"] == STARTUP_MODEL
+        out.append(m)
+    return {"models": out}
+
+
+@app.post("/api/model/switch")
+async def model_switch(req: Request):
+    """Hot-swap the live model to another Qwen3.5-family checkpoint. Only the startup model has calibration
+    (act_scale, mood probe, lens words); anything else runs raw and is labelled uncalibrated in the UI."""
+    if NO_MODEL:
+        return JSONResponse({"error": "the live model is off (EXPLORER_NO_MODEL=1)"}, status_code=400)
+    b = await req.json()
+    mid = (b.get("model") or "").strip()
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", mid):
+        return JSONResponse({"error": "model id looks wrong (expected org/name)"}, status_code=400)
+    if rt.status == "loading":
+        return JSONResponse({"error": "a model is still loading"}, status_code=409)
+    if rt._reading is not None or rt._fire is not None or rt._capture_full is not None or rt._capture_all is not None:
+        return JSONResponse({"error": "a run is in flight; wait for it to finish"}, status_code=409)
+    try:
+        cfg = AutoConfig.from_pretrained(mid)  # config only; weights download in the loader thread if missing
+        tc = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
+        archs = getattr(tc, "architectures", None) or getattr(cfg, "architectures", None) or []
+    except Exception as e:
+        return JSONResponse({"error": f"cannot read {mid}: {e}"}, status_code=400)
+    if not any("Qwen3_5" in a for a in archs):
+        return JSONResponse({"error": f"{mid} is {archs[0] if archs else 'unknown architecture'}; this page's hooks and probes are Qwen3.5-family specific"}, status_code=400)
+
+    def work():
+        global LIVE_ARCH
+        try:
+            rt.switch_model(mid)
+            if rt.model is not None:
+                LIVE_ARCH = live_arch(mid)
+                _mood_load()
+        except Exception as e:
+            print(f"model switch to {mid} failed: {e}", file=sys.stderr, flush=True)
+
+    threading.Thread(target=work, daemon=True).start()
+    return {"ok": True, "model": mid, "calibrated": mid == STARTUP_MODEL}
 
 
 
@@ -1219,6 +1308,55 @@ from advisor import Advisor, MAX_Q as ADV_MAX_Q  # noqa: E402
 
 adv = Advisor()
 ADV_WINDOW = int(os.environ.get("EXPLORER_ADV_WINDOW", "512"))  # token positions scored per ask (1.2 MB/token/layer)
+
+# The live reading for the last few asks, keyed by run id: {pos: {"pos", "tok", "read", "lens"}}. Sparse, so a
+# whole answer is a few hundred KB, and /api/advisor/reading can serve it while the stream is still open.
+_reads = {}
+READS_KEEP = 8
+
+
+def _live_flag(v):
+    """A body flag that may arrive as true/false, 1/0 or a string; missing or null means on."""
+    return not (v is False or str(v).strip().lower() in ("0", "false", "no", "off"))
+
+
+import mood  # noqa: E402
+
+MOOD_REPORT = {"report": None}
+
+
+def _mood_load():
+    if rt.model is not None and rt.mood is None and getattr(rt, "calibrated", True):
+        # the probe was trained on STARTUP_MODEL's residuals; pointing it at another model is not a measurement
+        MOOD_REPORT["report"] = mood.load(rt)
+
+
+@app.get("/api/mood/status")
+def mood_status():
+    _mood_load()
+    return {"ready": rt.mood is not None, "emotions": mood.EMOTIONS, "report": MOOD_REPORT["report"],
+            "va": {e: list(v) for e, v in mood.VA.items()}}
+
+
+@app.post("/api/mood/build")
+def mood_build():
+    if NO_MODEL:
+        return JSONResponse({"error": "the live model is off (EXPLORER_NO_MODEL=1)"}, status_code=409)
+    rep = mood.build(rt)
+    MOOD_REPORT["report"] = mood.load(rt)
+    return rep
+
+
+@app.post("/api/mood/score")
+async def mood_score(req: Request):
+    b = await req.json()
+    text = (b.get("text") or "").strip()[:2000]
+    _mood_load()
+    if rt.mood is None or not text:
+        return JSONResponse({"error": "no probe or empty text"}, status_code=409)
+    with rt.lock:
+        z = mood.score_text(rt, text)
+    return {"emotions": mood.EMOTIONS, "z": [round(float(x), 2) for x in z]}
 
 
 @app.get("/api/advisor/status")
@@ -1235,12 +1373,63 @@ def _score_acts(acts):
     return np.where(acts >= 0, acts / pos, -(acts / neg)).astype(np.float32)
 
 
+TWEAK_MAX_DOSE, TWEAK_MAX_N = 1.0, 6
+
+
+def _parse_tweaks(raw):
+    """[{layer, n, dose}] from the page -> ([(layer, n, dose, "add")], error). Bounded so a typo cannot wreck the
+    model: doses are in residual-norm units and the coherent window is about 0.5 to 0.8 for the whole set."""
+    if not raw:
+        return [], None
+    if not isinstance(raw, list) or len(raw) > TWEAK_MAX_N:
+        return [], f"at most {TWEAK_MAX_N} tweaks"
+    out, seen = [], set()
+    n_layers = len(rt.lm.layers) if rt.model is not None else 32
+    for x in raw:
+        try:
+            layer, n, dose = int(x["layer"]), int(x["n"]), float(x["dose"])
+        except Exception:
+            return [], "each tweak needs layer, n and dose"
+        if not (0 <= layer < n_layers) or not (0 <= n < 9216):
+            return [], f"no such neuron L{layer}/N{n}"
+        if not (abs(dose) <= TWEAK_MAX_DOSE) or dose != dose:
+            return [], f"dose must be between -{TWEAK_MAX_DOSE} and {TWEAK_MAX_DOSE}"
+        if (layer, n) in seen:
+            return [], f"L{layer}/N{n} listed twice"
+        seen.add((layer, n))
+        if dose:
+            out.append((layer, n, dose, "add"))
+    return out, None
+
+
+@app.get("/api/neuron/words")
+def neuron_words(layer: int, n: int, k: int = 12):
+    """What a neuron says when pushed up and when pushed down (the steer lens), for the tweak tray."""
+    try:
+        idx = rt.steer_index() or rt.lens_index()
+        v = rt.vocab_strings()
+        return {"layer": layer, "n": n, "name": names().get(f"L{layer}/N{n}", ""),
+                "up": [v[t] for t in idx["up"][layer, n, :k]], "down": [v[t] for t in idx["down"][layer, n, :k]]}
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+
+
 @app.post("/api/advisor/ask")
 async def advisor_ask(req: Request):
-    """SSE: retrieval -> streamed tokens -> the scored activations for every token of the exchange."""
+    """SSE: retrieval -> streamed tokens -> a per-token reading.
+
+    With `live` on (the default) each token arrives with the neurons that fired to produce it and one logit-lens
+    token per layer, read out of the decode pass that is already running, so the map lights up as the answer is
+    written. `live: false` keeps the old two-pass behaviour: stream the text, then score every position of the
+    window into the dense cube the run tab reads.
+    """
     b = await req.json()
     question = (b.get("question") or "").strip()[:ADV_MAX_Q]
     max_new = int(b.get("max_new", 260))
+    live = _live_flag(b.get("live", 1))
+    pushes, bad = _parse_tweaks(b.get("pushes"))
+    if bad:
+        return JSONResponse({"error": bad}, status_code=400)
     if not question:
         return JSONResponse({"error": "empty question"}, status_code=400)
     if NO_MODEL or rt.tok is None:
@@ -1251,24 +1440,63 @@ async def advisor_ask(req: Request):
     def emit(ev):
         loop.call_soon_threadsafe(q.put_nowait, ev)
 
+    run = uuid.uuid4().hex[:12]
+    nm = names() if live else {}  # one snapshot: a rename in another tab must not rewrite a reading already shown
+    reads = []
+    state = {"question": question, "tokens": [], "created": datetime.now().isoformat(timespec="seconds"), "reads": {}}
+    if live:
+        _reads[run] = state
+        while len(_reads) > READS_KEEP:
+            _reads.pop(next(iter(_reads)))
+
+    def on_read(ev):
+        for r in ev.get("read", []):
+            r["name"] = nm.get(f"L{r['layer']}/N{r['n']}", "")
+        state["reads"][str(ev["pos"])] = ev
+        reads.append(ev)
+        emit({"stage": "read", "run": run, **ev})
+
     def work():
         try:
             t0 = __import__("time").perf_counter()
             hits, crisis = adv.gather(question)
             sources = [h["source"] for h in hits]
-            emit({"stage": "retrieval", "sources": sources, "titles": [h["title"] for h in hits],
-                  "crisis": crisis, "ms": round((__import__("time").perf_counter() - t0) * 1000)})
+            emit({"stage": "retrieval", "run": run, "live": live, "sources": sources, "pushes": b.get("pushes") or [],
+                  "titles": [h["title"] for h in hits], "crisis": crisis,
+                  "ms": round((__import__("time").perf_counter() - t0) * 1000)})
+            if rt.mood is not None:
+                try:
+                    with rt.lock:
+                        zq = mood.score_text(rt, question)
+                    emit({"stage": "mood_in", "run": run, "mood": [round(float(x), 2) for x in zq]})
+                except Exception as e:
+                    print(f"mood_in skipped: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
             messages = adv.messages(question, hits)
             prompt_ids = rt.messages_ids(messages)
-            emit({"stage": "prompt", "prompt_tokens": len(prompt_ids)})
+            emit({"stage": "prompt", "prompt_tokens": len(prompt_ids), "live": live})
 
             gen_ids, answer = [], ""
-            for delta, tid in rt.generate_messages(messages, max_new=max_new, cancel=cancel):
+            for delta, tid in rt.generate_messages(messages, max_new=max_new, cancel=cancel,
+                                                   read=on_read if live else None, pushes=pushes):
                 if delta is None:
                     break
                 gen_ids.append(tid)
                 answer += delta
                 emit({"stage": "token", "t": delta})
+
+            if live:
+                # the sparse reading is the artifact: no second pass, and the panel paints from the events.
+                # (_infer is left alone on purpose: a dense [L, T, N] cube is 1.2 MB per position and is what
+                # the old post-hoc path exists to compute.)
+                units = rt.token_units(gen_ids)
+                state["tokens"] = [u[0] for u in units]
+                state["answer"] = answer
+                emit({"stage": "done", "run": run, "live": True, "pushes": b.get("pushes") or [], "answer": answer, "sources": sources,
+                      "crisis": crisis, "citations": adv.citations(sources, answer),
+                      "tokens": [u[0] for u in units], "pos": [u[1][-1] for u in units],
+                      "answer_from": 0, "scored": len(reads), "prompt_tokens": len(prompt_ids),
+                      "gen_tokens": len(gen_ids)})
+                return
 
             emit({"stage": "scoring", "gen_tokens": len(gen_ids)})
             full = prompt_ids + gen_ids
@@ -1283,14 +1511,156 @@ async def advisor_ask(req: Request):
             _infer.clear()
             _infer.update(ids=win_ids, toks=[units[unit_of[i]][0] for i in range(len(win_ids))],
                           acts=acts, score=score, answer_from=len(prompt_ids) - start)
-            emit({"stage": "done", "answer": answer, "sources": sources, "crisis": crisis,
-                  "citations": adv.citations(sources, answer),
+            emit({"stage": "done", "run": run, "live": False, "answer": answer, "sources": sources,
+                  "crisis": crisis, "citations": adv.citations(sources, answer),
                   "tokens": [u[0] for u in units], "pos": [u[1][-1] for u in units],
                   "answer_from": len(prompt_ids) - start, "scored": int(score.shape[1]),
                   "prompt_tokens": len(prompt_ids), "gen_tokens": len(gen_ids)})
         except Exception as e:  # surfaced in the panel rather than a dead stream
             emit({"stage": "error", "error": f"{type(e).__name__}: {e}"})
             loop.call_soon_threadsafe(q.put_nowait, None)  # same loop as emit, or it can overtake the event
+
+    threading.Thread(target=work, daemon=True).start()
+
+    async def events():
+        try:
+            while True:
+                ev = await q.get()
+                if ev is None:
+                    break
+                yield f"data: {json.dumps(ev)}\n\n"
+                if ev.get("stage") in ("done", "error"):
+                    break
+                if await req.is_disconnected():
+                    cancel.set()
+                    break
+        finally:
+            cancel.set()
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+
+
+@app.get("/api/advisor/reading")
+def advisor_reading(run: str = "", i: int = -1):
+    """The live reading of an ask: one token's firings (`i`), or every token captured so far.
+
+    `run` is the id from the retrieval event. `readings` come back in token order; each is
+    {"pos", "tok", "read": [{layer, n, s, a, w, name}], "lens": [[layer, token], ...]}. Readable while the ask
+    is still streaming, which is what a scrubber needs.
+    """
+    r = _reads.get(run)
+    if r is None:
+        return {"ready": False, "readings": []}
+    items = list(r["reads"].items())
+    if i >= 0:
+        return {"ready": True, "run": run, "reading": dict(items).get(str(i)), "tokens": r["tokens"],
+                "n": len(items), "question": r.get("question", "")}
+    return {"ready": True, "run": run, "n": len(items), "tokens": r["tokens"],
+            "question": r.get("question", ""), "readings": [ev for _, ev in sorted(items, key=lambda kv: int(kv[0]))]}
+
+
+# ---------- replay: read a public answer, which another model wrote ----------
+ADV_TAPS = os.path.join(ROOT, "explorer", "cache", "advisor_taps")
+
+
+@app.get("/api/advisor/taps")
+def advisor_taps():
+    """The public answers pulled from the Jetson, newest first. The list is a menu; the replay reads the file."""
+    out = []
+    try:
+        names_ = os.listdir(ADV_TAPS)
+    except FileNotFoundError:
+        return {"taps": [], "dir": ADV_TAPS}
+    for name in names_:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(ADV_TAPS, name), encoding="utf-8") as fh:
+                t = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        out.append({
+            "id": t.get("id") or name[:-5], "ts": t.get("ts"), "model": t.get("model"),
+            "served_by": t.get("served_by"), "question": (t.get("question") or "")[:240],
+            "answer_chars": len(t.get("answer") or ""), "crisis": bool(t.get("crisis")),
+        })
+    out.sort(key=lambda t: t.get("ts") or 0, reverse=True)
+    return {"taps": out, "dir": ADV_TAPS}
+
+
+@app.post("/api/advisor/replay")
+async def advisor_replay(req: Request):
+    """SSE: read a public answer the way the panel reads a live one, by teacher-forcing the tap's own prompt.
+
+    The text was written by another model, so every event carries `replay: true` and the panel names that
+    writer. The `read` events are the live ones, so the map, the strip, the scrubber and hover work unchanged.
+    """
+    b = await req.json()
+    tid = str(b.get("id") or "")
+    if not re.fullmatch(r"[0-9a-f]{6,32}", tid):
+        return JSONResponse({"error": "bad tap id"}, status_code=400)
+    try:
+        with open(os.path.join(ADV_TAPS, tid + ".json"), encoding="utf-8") as fh:
+            tap = json.load(fh)
+    except FileNotFoundError:
+        return JSONResponse({"error": "no such tap; run scripts/pull_taps.py"}, status_code=404)
+    except (OSError, ValueError) as exc:
+        return JSONResponse({"error": f"could not read the tap: {exc}"}, status_code=500)
+    messages = tap.get("messages") or []
+    answer = tap.get("answer") or ""
+    if len(messages) != 2 or not answer:
+        return JSONResponse({"error": "that tap has no replayable prompt"}, status_code=409)
+    if NO_MODEL or rt.tok is None:
+        return JSONResponse({"error": "the live model is off (EXPLORER_NO_MODEL=1)"}, status_code=409)
+
+    loop, q, cancel = asyncio.get_running_loop(), asyncio.Queue(), threading.Event()
+
+    def emit(ev):
+        loop.call_soon_threadsafe(q.put_nowait, ev)
+
+    run = uuid.uuid4().hex[:12]
+    nm = names()
+    reads = []
+    sources = [str(s) for s in (tap.get("sources") or [])]
+    state = {"question": tap.get("question") or "", "tokens": [],
+             "created": datetime.now().isoformat(timespec="seconds"), "reads": {}}
+    _reads[run] = state
+    while len(_reads) > READS_KEEP:
+        _reads.pop(next(iter(_reads)))
+
+    def on_read(ev):
+        for r in ev.get("read", []):
+            r["name"] = nm.get(f"L{r['layer']}/N{r['n']}", "")
+        state["reads"][str(ev["pos"])] = ev
+        reads.append(ev)
+        emit({"stage": "read", "run": run, "replay": True, **ev})
+
+    def work():
+        try:
+            prompt_tokens = len(rt.messages_ids(messages))
+            emit({"stage": "retrieval", "run": run, "replay": True, "live": False,
+                  "question": state["question"], "model": tap.get("model"),
+                  "served_by": tap.get("served_by"), "sources": sources, "titles": [],
+                  "crisis": bool(tap.get("crisis")), "ms": 0})
+            emit({"stage": "prompt", "prompt_tokens": prompt_tokens, "replay": True})
+            ids, text = [], ""
+            for delta, tok_id in rt.replay_messages(messages, answer, cancel=cancel, read=on_read):
+                if delta is None:
+                    break
+                ids.append(tok_id)
+                text += delta
+                emit({"stage": "token", "t": delta})
+            units = rt.token_units(ids)
+            state["tokens"] = [u[0] for u in units]
+            state["answer"] = text
+            emit({"stage": "done", "run": run, "replay": True, "live": False, "answer": text,
+                  "sources": sources, "citations": [],
+                  "tokens": [u[0] for u in units], "pos": [u[1][-1] for u in units],
+                  "answer_from": 0, "scored": len(reads), "prompt_tokens": prompt_tokens,
+                  "gen_tokens": len(ids), "model": tap.get("model"), "served_by": tap.get("served_by")})
+        except Exception as e:  # surfaced in the panel rather than a dead stream
+            emit({"stage": "error", "error": f"{type(e).__name__}: {e}"})
+            loop.call_soon_threadsafe(q.put_nowait, None)
 
     threading.Thread(target=work, daemon=True).start()
 
@@ -1435,6 +1805,7 @@ def preload():
             rt.vocab_strings()
             return
         rt.ensure_loaded()
+        _mood_load()
         if not os.path.exists(LENS_INDEX):
             os.makedirs(os.path.dirname(LENS_INDEX), exist_ok=True)
             rt.build_lens_index(LENS_INDEX)

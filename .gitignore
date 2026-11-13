@@ -2,12 +2,17 @@
 __pycache__/
 .DS_Store
 
+# local secrets: the tap reader's URL and token
+.env.local
+
 # sweep data and derived files
 runs/
 stats/
 captures/
 logs/
 explorer/cache/connections.sqlite
+# public exchanges pulled from the Jetson's tap (contains other people's questions)
+explorer/cache/advisor_taps/
 
 # third-party material
 source/
