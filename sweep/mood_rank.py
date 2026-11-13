@@ -135,7 +135,11 @@ def main():
         w_down = lm.layers[layer].mlp.down_proj.weight.detach().float().T.cpu().numpy()  # [neurons, hidden]
         wn = w_down / (np.linalg.norm(w_down, axis=1, keepdims=True) + 1e-9)
         cos = (wn @ f["D"].T).T.astype(np.float16)  # [12, neurons]
-        z_per_dose = (cos.astype(np.float32) * f["resid_norm_p50"] / f["spec_sd"][:, None])
+        # A push of `add` along w_down changes the raw projection by add * cos; the probe divides that by the emotion's
+        # neutral spread sd, then the common-mode-corrected score divides by spec_sd. Both factors belong here or the
+        # number is in raw residual units mislabelled as z (which read as +60 per unit dose).
+        z_per_dose = (cos.astype(np.float32) * f["resid_norm_p50"]
+                      / f["sd"][:, None] / f["spec_sd"][:, None])
         # What the probe shows is z minus the mean of the twelve, so the push a neuron buys on a specific emotion is
         # its projection minus the average of its projections: without this, the neurons that lift every emotion at
         # once (the common emotional component) top all twelve lists and the ranking says nothing.
