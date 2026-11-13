@@ -135,20 +135,26 @@ def main():
         w_down = lm.layers[layer].mlp.down_proj.weight.detach().float().T.cpu().numpy()  # [neurons, hidden]
         wn = w_down / (np.linalg.norm(w_down, axis=1, keepdims=True) + 1e-9)
         cos = (wn @ f["D"].T).T.astype(np.float16)  # [12, neurons]
-        z_per_dose = (cos.astype(np.float32) * f["resid_norm_p50"] / f["spec_sd"][:, None]).astype(np.float16)
-        np.savez(os.path.join(a.out, f"L{layer}.npz"), cos=cos, z_per_dose=z_per_dose, dirs=f["D"], mu=f["mu"],
+        z_per_dose = (cos.astype(np.float32) * f["resid_norm_p50"] / f["spec_sd"][:, None])
+        # What the probe shows is z minus the mean of the twelve, so the push a neuron buys on a specific emotion is
+        # its projection minus the average of its projections: without this, the neurons that lift every emotion at
+        # once (the common emotional component) top all twelve lists and the ranking says nothing.
+        z_spec = (z_per_dose - z_per_dose.mean(0, keepdims=True)).astype(np.float16)
+        np.savez(os.path.join(a.out, f"L{layer}.npz"), cos=cos, z_per_dose=z_per_dose.astype(np.float16),
+                 z_spec=z_spec, dirs=f["D"], mu=f["mu"],
                  sd=f["sd"], mean_neu=f["mean_neu"], spec_mean=f["spec_mean"], spec_sd=f["spec_sd"],
                  resid_norm_p50=f["resid_norm_p50"], layer=layer, emotions=np.array(names),
                  accuracy=f["accuracy"])
         report["layers"][str(layer)] = {"accuracy": round(f["accuracy"], 3),
                                         "resid_norm_p50": round(f["resid_norm_p50"], 1),
+                                        "top_spec_z": {e: round(float(z_spec[i].max()), 3) for i, e in enumerate(names)},
                                         "top_cos": {e: round(float(cos[i].max()), 3) for i, e in enumerate(names)}}
         print(f"L{layer}: held-out acc {f['accuracy']:.2f}  resid p50 {f['resid_norm_p50']:.0f}  "
-              f"best cos {cos.max():.3f} ({names[int(cos.max(1).argmax())]})", flush=True)
+              f"best spec z {z_spec.max():+.3f} ({names[int(z_spec.max(1).argmax())]})", flush=True)
         if layer in show_layers:
             for i, e in enumerate(names):
-                top = np.argsort(-cos[i])[: a.show]
-                print(f"  {e:11s} " + " ".join(f"N{int(n)}({cos[i, n]:+.2f})" for n in top), flush=True)
+                top = np.argsort(-z_spec[i])[: a.show]
+                print(f"  {e:11s} " + " ".join(f"N{int(n)}({z_spec[i, n]:+.2f})" for n in top), flush=True)
 
     json.dump(report, open(os.path.join(a.out, "report.json"), "w"), indent=1)
     print(f"wrote {a.out}/ ({len(layers)} layers)")
